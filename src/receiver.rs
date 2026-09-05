@@ -869,18 +869,20 @@ impl SessionCtx {
         let use_hw = self.state.use_hw_decode.load(Ordering::SeqCst);
         let rtp_port = self.rtp_port.load(Ordering::SeqCst);
 
-        // Build → wire bus → PLAYING, with a decode fallback (HW→SW). Audio is
-        // decided UP FRONT by a fast probe rather than by failing PLAYING: a
-        // failed audio attempt costs a full state() wait, which previously
-        // pushed the M7/PLAY response past the source's RTSP timeout ("No M7
-        // response"). So probe once here — if no audio sink can open (e.g. no
-        // PulseAudio session under sudo), build video-only on the first try.
+        // Build → wire bus → PLAYING. Two fallback axes, tried inline because a
+        // failed PLAYING is a SYNCHRONOUS StateChangeError the bus-watch misses:
+        //   • decode: HW (vaapi/nvh264) → SW (avdec_h264)
+        //   • audio:  with the audio branch → video-only
+        // Audio under sudo is unreliable (no PA session; pulsesink fails at
+        // PLAYING with "Connection refused", and even autoaudiosink's backends
+        // — PipeWire/ALSA/openal — can fail). The up-front probe is only a HINT
+        // (it can pick a different sink than the pipeline), so we ALSO keep a
+        // reactive video-only fallback. Attempts are ordered so video-only
+        // always follows an audio attempt for the same decoder, and the whole
+        // thing stays fast so the RTSP M7/PLAY response is not delayed.
         let want_audio = self.audio_enabled && Self::audio_sink_available();
         if self.audio_enabled && !want_audio {
-            log::warn!(
-                "Audio disabled: no audio sink could open (no PulseAudio session? — running \
-                 under sudo drops the user audio session). Streaming video-only."
-            );
+            log::info!("Audio probe: no working audio sink — will stream video-only");
         }
         let mut attempts: Vec<(bool, bool)> = Vec::new();
         for &hw in if use_hw {
@@ -888,7 +890,10 @@ impl SessionCtx {
         } else {
             &[false][..]
         } {
-            attempts.push((hw, want_audio));
+            if want_audio {
+                attempts.push((hw, true));
+            }
+            attempts.push((hw, false));
         }
         let mut pipeline: Option<gst::Pipeline> = None;
         let n_attempts = attempts.len();
