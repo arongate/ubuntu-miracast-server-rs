@@ -329,14 +329,34 @@ impl ServerSessionRecord {
 }
 
 fn iso(dt: &DateTime<Local>) -> String {
-    // Matches Python datetime.isoformat() (local, with microseconds + offset).
-    dt.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string()
+    // Match Python datetime.isoformat() on a NAIVE local datetime: no timezone
+    // offset suffix (the Python app stored e.g. "2026-08-22T22:13:45.593112").
+    // Emitting an offset here would make files unreadable by the Python build
+    // and diverge from the on-disk format we must stay compatible with.
+    dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
 }
 
 fn parse_iso(s: &str) -> Result<DateTime<Local>, ValidationError> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Local))
-        .map_err(|e| ValidationError(format!("failed to deserialize ServerSessionRecord: {e}")))
+    use chrono::{NaiveDateTime, TimeZone};
+
+    // Preferred: naive ISO 8601 (no offset) as written by both Python and our
+    // own writer — interpret in the local timezone.
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        if let chrono::LocalResult::Single(dt) = Local.from_local_datetime(&naive) {
+            return Ok(dt);
+        }
+        // Ambiguous/absent local time (DST edge): fall back to the earliest.
+        if let Some(dt) = Local.from_local_datetime(&naive).earliest() {
+            return Ok(dt);
+        }
+    }
+    // Also accept offset-bearing RFC 3339 (e.g. legacy files with a +hh:mm/Z).
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Local));
+    }
+    Err(ValidationError(format!(
+        "failed to deserialize ServerSessionRecord: unparseable datetime {s:?}"
+    )))
 }
 
 fn as_string(v: &Value) -> String {
@@ -468,5 +488,39 @@ mod tests {
     fn from_dict_missing_field_errors() {
         let v = json!({"source_info": {}, "stats": {}});
         assert!(ServerSessionRecord::from_dict(&v).is_err());
+    }
+
+    #[test]
+    fn parses_naive_python_datetimes() {
+        // Regression: the Python app wrote naive ISO datetimes with NO tz offset.
+        // parse_from_rfc3339 rejected these ("premature end of input"), spamming
+        // history-load errors. from_dict must accept the naive form.
+        let v = json!({
+            "source_info": {"name": "Miracast Source", "address": "be:10:7b:d4:df:b8", "model": ""},
+            "stats": {
+                "start_time": "2026-08-22T22:13:45.593112",
+                "end_time": "2026-08-22T22:14:15.624221",
+                "duration": 30, "data_received": 0,
+                "frames_decoded": 0, "frames_dropped": 0
+            },
+            "timestamp": "2026-08-22T22:14:15.624298"
+        });
+        let rec = ServerSessionRecord::from_dict(&v).expect("naive datetimes must parse");
+        assert_eq!(rec.stats.duration, 30);
+        assert_eq!(rec.source_info.address, "be:10:7b:d4:df:b8");
+    }
+
+    #[test]
+    fn naive_datetime_roundtrips() {
+        let v = json!({
+            "source_info": {"name": "x", "address": "00:11:22:33:44:55", "model": ""},
+            "stats": {"start_time": "2026-08-22T22:13:45.593112", "end_time": null,
+                      "duration": 1, "data_received": 0, "frames_decoded": 0, "frames_dropped": 0},
+            "timestamp": "2026-08-22T22:14:15.624298"
+        });
+        let rec = ServerSessionRecord::from_dict(&v).unwrap();
+        // Our writer emits the same naive (offset-free) form and re-parses.
+        let back = ServerSessionRecord::from_dict(&rec.to_dict()).unwrap();
+        assert_eq!(back.stats.duration, 1);
     }
 }

@@ -213,19 +213,35 @@ fn wait_for_group_interface(timeout: Duration) -> Option<String> {
     while Instant::now() < deadline {
         if let Ok(out) = Command::new("ip").args(["link", "show"]).output() {
             if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if line.contains(": p2p-") {
-                        // "<idx>: p2p-...@parent: ..." → take the iface name.
-                        if let Some((_, rest)) = line.split_once(": ") {
-                            let iface = rest.split('@').next().unwrap_or(rest);
-                            let iface = iface.trim_end_matches(':');
-                            return Some(iface.to_string());
-                        }
-                    }
+                if let Some(iface) = parse_group_interface(&String::from_utf8_lossy(&out.stdout)) {
+                    return Some(iface);
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// Extract the first `p2p-*` interface name from `ip link show` output.
+///
+/// `ip link` lines look like `2: p2p-0: <FLAGS> mtu 1500 ...`. The iface name
+/// is the segment BETWEEN the first and second `": "` (Python:
+/// `parts = line.split(": "); parts[1].split("@")[0].rstrip(":")`). Splitting on
+/// only the first delimiter captures the whole flags-and-mtu tail as the name,
+/// which then poisons every `wpa_cli -i <name>` call.
+fn parse_group_interface(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if line.contains(": p2p-") {
+            let parts: Vec<&str> = line.split(": ").collect();
+            if parts.len() >= 2 {
+                let iface = parts[1].split('@').next().unwrap_or(parts[1]);
+                let iface = iface.trim_end_matches(':').trim();
+                if !iface.is_empty() {
+                    return Some(iface.to_string());
+                }
+            }
+        }
     }
     None
 }
@@ -251,5 +267,25 @@ mod tests {
     fn subelement_constants_match_python() {
         assert_eq!(WFD_ASSOCIATED_BSSID_SUBELEMENT, "0006000000000000");
         assert_eq!(WFD_COUPLED_SINK_SUBELEMENT, "000700000000000000");
+    }
+
+    #[test]
+    fn parses_iface_name_not_the_whole_ip_link_line() {
+        // Exact shape from the field logs that caused every wps_pin to fail.
+        let out = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\n\
+                   3: p2p-0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DORMANT group default qlen 1000";
+        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-0"));
+    }
+
+    #[test]
+    fn parses_iface_name_with_parent_suffix() {
+        let out = "5: p2p-wlan0-0@wlan0: <BROADCAST,MULTICAST> mtu 1500 qdisc noqueue state DOWN";
+        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-wlan0-0"));
+    }
+
+    #[test]
+    fn no_p2p_interface_returns_none() {
+        let out = "1: lo: <LOOPBACK,UP> mtu 65536\n2: wlan0: <BROADCAST,UP> mtu 1500";
+        assert_eq!(parse_group_interface(out), None);
     }
 }

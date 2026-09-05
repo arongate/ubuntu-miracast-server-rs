@@ -125,29 +125,35 @@ impl ConnectionHandler {
         *self.shared.group_interface.lock().unwrap() = Some(group_interface.clone());
         self.shared.running.store(true, Ordering::SeqCst);
 
-        // Set up IP + DHCP FIRST (before any client tries to connect).
-        let our_ip = setup_dhcp(&group_interface);
-        *self.shared.our_ip.lock().unwrap() = our_ip;
-
-        // Generate + arm WPS PIN.
-        let pin = generate_pin();
-        *self.shared.current_pin.lock().unwrap() = Some(pin.clone());
-        arm_wps_pin(&self.shared);
-
-        let _ = self.shared.events.send(Event::PinDisplay {
-            pin: pin.clone(),
-            peer_info: "Waiting for source...".to_string(),
-        });
-
-        // Start the event monitor thread on the group interface.
+        // NOTE: DHCP setup and the initial WPS-PIN arm each block for seconds
+        // (dnsmasq spawn + up to 10×1s wps_pin retries). The Python armed these
+        // synchronously, but our caller is the GTK main loop's event drain, so
+        // doing that here freezes the UI ("not responding"). Move ALL blocking
+        // setup into the monitor thread; start_listening returns immediately.
         let shared = Arc::clone(&self.shared);
+        let group = group_interface.clone();
         self.thread = Some(
             std::thread::Builder::new()
                 .name("go-event-monitor".to_string())
-                .spawn(move || event_monitor_loop(shared))
+                .spawn(move || {
+                    // Set up IP + DHCP FIRST (before any client tries to connect).
+                    let our_ip = setup_dhcp(&group);
+                    *shared.our_ip.lock().unwrap() = our_ip;
+
+                    // Generate + arm the initial WPS PIN.
+                    let pin = generate_pin();
+                    *shared.current_pin.lock().unwrap() = Some(pin.clone());
+                    let _ = shared.events.send(Event::PinDisplay {
+                        pin: pin.clone(),
+                        peer_info: "Waiting for source...".to_string(),
+                    });
+                    arm_wps_pin(&shared);
+                    log::info!("Listening on {group} with PIN {pin}");
+
+                    event_monitor_loop(shared);
+                })
                 .expect("spawn go-event-monitor"),
         );
-        log::info!("Listening on {group_interface} with PIN {pin}");
     }
 
     /// Stop listening for connections.
@@ -173,15 +179,21 @@ impl ConnectionHandler {
     }
 
     /// Generate a new PIN and re-arm WPS for the next connection.
+    ///
+    /// Called from the GTK event drain, so the up-to-10s arm runs on a detached
+    /// thread rather than blocking the main loop.
     pub fn rearm_wps_pin(&self) {
         let pin = generate_pin();
         *self.shared.current_pin.lock().unwrap() = Some(pin.clone());
-        arm_wps_pin(&self.shared);
         let _ = self.shared.events.send(Event::PinDisplay {
             pin: pin.clone(),
             peer_info: "Waiting for source...".to_string(),
         });
-        log::info!("Re-armed WPS with new PIN {pin}");
+        let shared = Arc::clone(&self.shared);
+        std::thread::spawn(move || {
+            arm_wps_pin(&shared);
+            log::info!("Re-armed WPS with new PIN {pin}");
+        });
     }
 }
 
