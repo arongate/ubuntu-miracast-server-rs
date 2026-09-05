@@ -196,6 +196,14 @@ impl P2pBackend for DbusBackend {
             .map_err(|e| BackendError::Runtime(format!("P2PDevice.Find failed: {e}")))?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
+        // (c1) Self-heal: remove any pre-existing `p2p-*` groups. wpa_supplicant
+        //      caps concurrent P2P groups; stale autonomous GOs left by a prior
+        //      crash/run saturate that limit, after which GroupAdd returns
+        //      InvalidArgs ("Did not receive correct message arguments") — the
+        //      intermittent failure seen in the field. Clearing them first makes
+        //      startup robust to a dirty state.
+        remove_stale_p2p_groups(&iface);
+
         // (d) GroupAdd — autonomous GO.
         //
         // NOTE: the wpa_cli *command* `p2p_group_add persistent` takes a
@@ -474,6 +482,50 @@ impl DbusBackend {
 }
 
 // ---- Free helpers ----------------------------------------------------------
+
+/// Remove any existing `p2p-*` group interfaces before creating a new GO.
+///
+/// wpa_supplicant caps concurrent P2P groups; leftovers from a prior crash or
+/// run make `GroupAdd` fail with `InvalidArgs`. We enumerate them from
+/// `ip link` and remove each via `wpa_cli -i <parent> p2p_group_remove <grp>`
+/// (there is no D-Bus method to remove a group by name, and the group has no
+/// D-Bus object). Best-effort: failures are logged at debug and ignored.
+fn remove_stale_p2p_groups(parent_iface: &str) {
+    let out = match std::process::Command::new("ip")
+        .args(["link", "show"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut removed = 0;
+    for line in text.lines() {
+        if !line.contains(": p2p-") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(": ").collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let grp = parts[1]
+            .split('@')
+            .next()
+            .unwrap_or(parts[1])
+            .trim_end_matches(':')
+            .trim();
+        if grp.is_empty() {
+            continue;
+        }
+        match crate::utils::run_wpa_cli(parent_iface, &["p2p_group_remove", grp], false, None) {
+            Ok(_) => removed += 1,
+            Err(e) => log::debug!("stale group {grp} remove failed (ignored): {e}"),
+        }
+    }
+    if removed > 0 {
+        log::info!("Cleared {removed} stale P2P group(s) before GroupAdd");
+    }
+}
 
 /// Decode an even-length hex string to bytes. Returns `Value`/Runtime error on
 /// malformed input (should never happen for compile-time constants).
