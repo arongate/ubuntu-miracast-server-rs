@@ -41,10 +41,12 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const FRAME_DROP_WARNING_THRESHOLD: f64 = 0.05; // 5%
 const FRAME_DROP_WINDOW: Duration = Duration::from_secs(10);
 
-// Queue bounds.
+// Queue bounds. QUEUE_MAX_TIME is deliberately SMALL: this is a LIVE Miracast
+// feed, so a large time buffer just becomes accumulated latency (lag). 200ms is
+// enough to absorb Wi-Fi jitter without a visible delay.
 const QUEUE_MAX_BUFFERS: u32 = 200;
 const QUEUE_MAX_BYTES: u32 = 10_485_760; // 10 MB
-const QUEUE_MAX_TIME: u64 = 1_000_000_000; // 1 s in ns
+const QUEUE_MAX_TIME: u64 = 200_000_000; // 200 ms in ns
 
 // RTSP connection constants.
 const RTSP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -324,19 +326,25 @@ impl PipelineBuilder {
             .name("videosink")
             .build()
         {
-            // Disable QoS: with software decode marginally behind real time, a
-            // QoS-enabled sink tells upstream to DROP frames to catch up, which
-            // shows as stutter / smeared quality. Prefer keeping frames.
+            // Live low-latency display: render frames as they arrive.
+            // sync=false — do NOT hold frames to their presentation timestamps;
+            //   for a live Miracast feed, PTS-syncing turns initial buffering
+            //   into permanent lag that only grows. Display on arrival instead.
+            // qos=false — don't let the sink ask upstream to DROP frames to
+            //   catch up (that shows as stutter/smearing).
+            set_if_has(&sink, "sync", false);
             set_if_has(&sink, "qos", false);
-            log::info!("Using gtk4paintablesink for video output");
+            log::info!("Using gtk4paintablesink for video output (live, sync off)");
             return Ok(sink);
         }
         let sink = gst::ElementFactory::make("autovideosink")
             .name("videosink")
             .build()
             .map_err(|_| "Failed to create video sink element".to_string())?;
+        // autovideosink proxies to its child sink; its own sync/qos forward.
+        set_if_has(&sink, "sync", false);
         set_if_has(&sink, "qos", false);
-        log::info!("Using autovideosink for video output");
+        log::info!("Using autovideosink for video output (live, sync off)");
         Ok(sink)
     }
 }
