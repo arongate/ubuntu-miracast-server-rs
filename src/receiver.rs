@@ -910,7 +910,21 @@ impl SessionCtx {
                 });
             }
 
-            if built.set_state(gst::State::Playing) != Err(gst::StateChangeError) {
+            // A live pipeline (udpsrc + tsdemux with dynamic pads) returns
+            // StateChangeSuccess::Async immediately — the transition only
+            // settles once data flows and the demuxer's video/audio pads are
+            // added and linked. So do NOT treat the immediate return as final:
+            // set PLAYING, then wait on get_state for the real outcome.
+            let start = built.set_state(gst::State::Playing);
+            let reached = match start {
+                Err(gst::StateChangeError) => false,
+                Ok(_) => {
+                    // Block up to 8s for the async transition to actually
+                    // complete (or fail once data starts flowing).
+                    built.state(gst::ClockTime::from_seconds(8)).0.is_ok()
+                }
+            };
+            if reached {
                 if hw {
                     log::info!("Pipeline reached PLAYING (hardware decode)");
                 } else if i > 0 {
@@ -922,8 +936,22 @@ impl SessionCtx {
                 break;
             }
 
-            // PLAYING failed. Tear this pipeline down. If it was the HW attempt
-            // and a SW attempt remains, fall through to rebuild in software.
+            // Transition failed. Drain any bus error for the real reason.
+            if let Some(bus) = built.bus() {
+                while let Some(msg) = bus.timed_pop(gst::ClockTime::ZERO) {
+                    if let gst::MessageView::Error(err) = msg.view() {
+                        log::error!(
+                            "PLAYING failure ({}decode): {} (debug: {:?})",
+                            if hw { "hardware " } else { "software " },
+                            err.error(),
+                            err.debug()
+                        );
+                    }
+                }
+            }
+
+            // Tear this pipeline down. If it was the HW attempt and a SW attempt
+            // remains, fall through to rebuild in software.
             let _ = built.set_state(gst::State::Null);
             if hw && i + 1 < attempts.len() {
                 log::warn!(
