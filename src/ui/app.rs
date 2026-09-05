@@ -98,7 +98,20 @@ fn activate(
 
     // Try a dedicated wpa_supplicant on a secondary adapter so the primary
     // adapter can stay on Wi-Fi (internet) while the secondary handles P2P.
-    let p2p_supplicant = start_dedicated_supplicant(&p2p_interface, &device_name);
+    //
+    // The D-Bus backend talks to the SYSTEM wpa_supplicant (netdev-group-gated,
+    // no sudo), so a sudo-spawned dedicated instance is both redundant and would
+    // break the root-free guarantee — skip it when D-Bus is selected.
+    let dbus_selected = std::env::var("MIRACAST_BACKEND")
+        .map(|v| v.eq_ignore_ascii_case("dbus"))
+        .unwrap_or(false)
+        && cfg!(feature = "dbus-backend");
+    let p2p_supplicant = if dbus_selected {
+        log::info!("D-Bus backend selected — using system wpa_supplicant, no dedicated instance");
+        None
+    } else {
+        start_dedicated_supplicant(&p2p_interface, &device_name)
+    };
     let (effective_interface, ctrl_path) = match &p2p_supplicant {
         Some(s) => (
             Some(s.interface().to_string()),
