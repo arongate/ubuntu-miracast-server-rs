@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"   # pre-release tags (e.g. v0.1.0-beta.1)
+
+permissions:
+  contents: write   # required to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain + dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper devscripts dh-make lintian \
+            cargo rustc pkg-config \
+            libgtk-4-dev libadwaita-1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches debian/changelog version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          # debian version: 0.1.0-beta.1 -> 0.1.0~beta1-1 ; compare the upstream part loosely
+          CHLOG="$(dpkg-parsechangelog -SVersion)"
+          echo "tag=$TAG changelog=$CHLOG"
+          # Non-fatal: warn if they diverge, since debian revision suffix differs by convention.
+          if ! echo "$CHLOG" | grep -q "$(echo "$TAG" | sed 's/-.*//')"; then
+            echo "::warning::tag $TAG does not obviously match changelog $CHLOG"
+          fi
+
+      - name: Build .deb (dpkg-buildpackage via debhelper)
+        run: |
+          dpkg-buildpackage -us -uc -b
+          mkdir -p dist
+          cp ../ubuntu-miracast-server_*_*.deb dist/ || cp ../*.deb dist/
+          ls -la dist/
+
+      - name: Lint the package (advisory)
+        run: lintian dist/*.deb || true
+
+      - name: Build standalone release binary tarball
+        run: |
+          cargo build --release --locked --features gui
+          VER="${GITHUB_REF_NAME#v}"
+          strip target/release/ubuntu-miracast-server || true
+          install -Dm755 target/release/ubuntu-miracast-server \
+            "pkg/ubuntu-miracast-server-${VER}-x86_64/ubuntu-miracast-server"
+          install -Dm644 README.md "pkg/ubuntu-miracast-server-${VER}-x86_64/README.md"
+          install -Dm644 LICENSE  "pkg/ubuntu-miracast-server-${VER}-x86_64/LICENSE"
+          install -Dm644 debian/ubuntu-miracast-server.desktop \
+            "pkg/ubuntu-miracast-server-${VER}-x86_64/ubuntu-miracast-server.desktop"
+          tar -C pkg -czf "dist/ubuntu-miracast-server-${VER}-x86_64.tar.gz" \
+            "ubuntu-miracast-server-${VER}-x86_64"
+          ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tags containing '-' (e.g. -beta) are marked as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
