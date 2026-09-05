@@ -123,8 +123,15 @@ fn activate(
     let (tx, rx) = channel();
 
     // One P2P backend (wpa_cli by default; wpa_supplicant D-Bus when selected),
-    // shared by the advertiser and the connection handler.
-    let backend = crate::p2p_backend::select_backend(ctrl_path.clone());
+    // shared by the advertiser and the connection handler. Seed it with the
+    // dedicated supplicant's interface (falling back to the configured one) so
+    // it drives that instance's control socket, not the system supplicant's.
+    let backend = crate::p2p_backend::select_backend(
+        ctrl_path.clone(),
+        effective_interface
+            .clone()
+            .or_else(|| p2p_interface.clone()),
+    );
 
     let advertiser = Rc::new(RefCell::new(MiracastAdvertiser::new(
         device_name.clone(),

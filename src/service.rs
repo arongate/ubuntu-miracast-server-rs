@@ -268,7 +268,7 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
 
     let (tx, rx) = channel();
     // Service mode uses the system wpa_supplicant (no dedicated ctrl path).
-    let backend = crate::p2p_backend::select_backend(None);
+    let backend = crate::p2p_backend::select_backend(None, iface.clone());
     let mut advertiser = MiracastAdvertiser::new(
         name.clone(),
         rtsp_port,

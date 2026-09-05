@@ -112,7 +112,17 @@ pub mod dbus;
 /// Choose the backend at runtime. Defaults to the CLI (subprocess) backend;
 /// selects the D-Bus backend only when compiled in AND explicitly requested via
 /// `MIRACAST_BACKEND=dbus`.
-pub fn select_backend(ctrl_path: Option<String>) -> std::sync::Arc<dyn P2pBackend> {
+///
+/// `iface` is the interface the CLI backend should drive — the dedicated
+/// supplicant's interface when one was started, or the configured P2P interface.
+/// Without it the CLI backend falls back to `find_p2p_interface()`, which
+/// auto-discovers the SYSTEM supplicant's `p2p-dev-*` and does not match the
+/// dedicated supplicant's control socket (`ctrl_path`), so `wpa_cli` fails with
+/// "Failed to connect to non-global ctrl_ifname". The D-Bus backend ignores it.
+pub fn select_backend(
+    ctrl_path: Option<String>,
+    iface: Option<String>,
+) -> std::sync::Arc<dyn P2pBackend> {
     #[cfg(feature = "dbus-backend")]
     {
         let want_dbus = std::env::var("MIRACAST_BACKEND")
@@ -131,5 +141,5 @@ pub fn select_backend(ctrl_path: Option<String>) -> std::sync::Arc<dyn P2pBacken
         }
     }
     log::info!("P2P backend: wpa_cli (subprocess)");
-    std::sync::Arc::new(cli::WpaCliBackend::new(ctrl_path))
+    std::sync::Arc::new(cli::WpaCliBackend::new(ctrl_path).with_interface(iface))
 }
