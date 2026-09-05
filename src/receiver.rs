@@ -842,33 +842,44 @@ impl SessionCtx {
         let use_hw = self.state.use_hw_decode.load(Ordering::SeqCst);
         let rtp_port = self.rtp_port.load(Ordering::SeqCst);
 
-        // Build → wire bus → PLAYING, retrying once in SOFTWARE if a HW decoder
-        // (vaapidecodebin/nvh264dec) fails to reach PLAYING. A failed PLAYING
-        // transition is a SYNCHRONOUS StateChangeError, not a bus Error message,
-        // so the bus-watch fallback never sees it — we must retry inline here.
-        // `attempts` is [true, false] when HW was requested, else just [false].
-        let attempts: &[bool] = if use_hw { &[true, false] } else { &[false] };
+        // Build → wire bus → PLAYING, with two independent fallbacks, because a
+        // failed PLAYING transition is a SYNCHRONOUS StateChangeError the
+        // bus-watch never sees — we must retry inline:
+        //   • decode: HW (vaapi/nvh264) → SW (avdec_h264)
+        //   • audio:  with the audio branch → WITHOUT it (video-only)
+        // The audio sink (pulsesink) fails PLAYING with "Connection refused"
+        // when there is no PulseAudio session (e.g. running under sudo), and
+        // that failure takes the WHOLE pipeline — including video — down. So on
+        // an audio-sink error we rebuild audio-off and keep the picture.
+        // `attempts` = (use_hw, audio_enabled), most-capable first.
+        let want_audio = self.audio_enabled;
+        let mut attempts: Vec<(bool, bool)> = Vec::new();
+        for &hw in if use_hw {
+            &[true, false][..]
+        } else {
+            &[false][..]
+        } {
+            if want_audio {
+                attempts.push((hw, true));
+            }
+            attempts.push((hw, false));
+        }
         let mut pipeline: Option<gst::Pipeline> = None;
-        for (i, &hw) in attempts.iter().enumerate() {
-            let built = match builder.build_pipeline(
-                rtp_port,
-                &video_codec,
-                &audio_codec,
-                self.audio_enabled,
-                hw,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    let msg = format!("Failed to start pipeline: {e}");
-                    log::error!("{msg}");
-                    self.state.errors.fetch_add(1, Ordering::SeqCst);
-                    let _ = self.events.send(Event::StreamError(msg));
-                    return;
-                }
-            };
+        let n_attempts = attempts.len();
+        for (i, &(hw, audio)) in attempts.iter().enumerate() {
+            let built =
+                match builder.build_pipeline(rtp_port, &video_codec, &audio_codec, audio, hw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let msg = format!("Failed to start pipeline: {e}");
+                        log::error!("{msg}");
+                        self.state.errors.fetch_add(1, Ordering::SeqCst);
+                        let _ = self.events.send(Event::StreamError(msg));
+                        return;
+                    }
+                };
 
-            // Wire the bus watch (HW→SW fallback for async decode ERRORS, EOS,
-            // state) before going to PLAYING.
+            // Wire the bus watch (async decode ERRORS, EOS, state) before PLAYING.
             let bus = built.bus().expect("pipeline has a bus");
             {
                 let state = Arc::clone(&self.state);
@@ -912,48 +923,60 @@ impl SessionCtx {
 
             // A live pipeline (udpsrc + tsdemux with dynamic pads) returns
             // StateChangeSuccess::Async immediately — the transition only
-            // settles once data flows and the demuxer's video/audio pads are
-            // added and linked. So do NOT treat the immediate return as final:
-            // set PLAYING, then wait on get_state for the real outcome.
+            // settles once data flows and the demuxer's pads are added/linked.
+            // Do NOT treat the immediate return as final: set PLAYING, then wait
+            // on state() for the real outcome.
             let start = built.set_state(gst::State::Playing);
             let reached = match start {
                 Err(gst::StateChangeError) => false,
-                Ok(_) => {
-                    // Block up to 8s for the async transition to actually
-                    // complete (or fail once data starts flowing).
-                    built.state(gst::ClockTime::from_seconds(8)).0.is_ok()
-                }
+                Ok(_) => built.state(gst::ClockTime::from_seconds(8)).0.is_ok(),
             };
             if reached {
-                if hw {
-                    log::info!("Pipeline reached PLAYING (hardware decode)");
-                } else if i > 0 {
-                    log::info!("Pipeline reached PLAYING (software-decode fallback)");
-                } else {
-                    log::info!("Pipeline reached PLAYING (software decode)");
+                log::info!(
+                    "Pipeline reached PLAYING ({} decode{})",
+                    if hw { "hardware" } else { "software" },
+                    if audio { "" } else { ", video-only" }
+                );
+                if !audio && want_audio {
+                    log::warn!(
+                        "Audio disabled: the audio sink could not open (no PulseAudio \
+                         session? — running under sudo drops the user audio session)"
+                    );
                 }
                 pipeline = Some(built);
                 break;
             }
 
-            // Transition failed. Drain any bus error for the real reason.
+            // Transition failed. Drain the bus for the real reason and decide
+            // whether the AUDIO branch is the culprit.
+            let mut audio_culprit = false;
             if let Some(bus) = built.bus() {
                 while let Some(msg) = bus.timed_pop(gst::ClockTime::ZERO) {
                     if let gst::MessageView::Error(err) = msg.view() {
+                        let dbg = format!("{:?}", err.debug());
+                        if dbg.contains("pulsesink")
+                            || dbg.contains("audiosink")
+                            || dbg.contains("alsasink")
+                        {
+                            audio_culprit = true;
+                        }
                         log::error!(
-                            "PLAYING failure ({}decode): {} (debug: {:?})",
-                            if hw { "hardware " } else { "software " },
+                            "PLAYING failure ({} decode, audio={}): {} (debug: {})",
+                            if hw { "hardware" } else { "software" },
+                            audio,
                             err.error(),
-                            err.debug()
+                            dbg
                         );
                     }
                 }
             }
-
-            // Tear this pipeline down. If it was the HW attempt and a SW attempt
-            // remains, fall through to rebuild in software.
             let _ = built.set_state(gst::State::Null);
-            if hw && i + 1 < attempts.len() {
+
+            // If the audio branch killed it and this attempt still had audio on,
+            // jump straight to the matching audio-off attempt for this decoder.
+            if audio && audio_culprit {
+                log::warn!("Audio sink failed — retrying video-only");
+            } else if hw && i + 1 < n_attempts {
                 log::warn!(
                     "Hardware decoder failed to reach PLAYING — retrying with software decode"
                 );
