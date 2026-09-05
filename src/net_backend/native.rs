@@ -224,7 +224,15 @@ mod dhcp {
         let sock = match bind_to_iface(iface) {
             Ok(s) => s,
             Err(e) => {
-                log::error!("DHCP: failed to bind :67 on {iface}: {e}");
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    log::error!(
+                        "DHCP: bind :67 denied on {iface} — the binary lacks CAP_NET_BIND_SERVICE. \
+                         Run: sudo setcap 'cap_net_admin,cap_net_bind_service+ep' <binary> \
+                         (capabilities are cleared by every `cargo build`, so re-apply after each rebuild)."
+                    );
+                } else {
+                    log::error!("DHCP: failed to bind :67 on {iface}: {e}");
+                }
                 return;
             }
         };

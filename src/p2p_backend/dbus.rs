@@ -275,30 +275,16 @@ impl P2pBackend for DbusBackend {
     fn run_event_monitor(&self, group_interface: &str, tx: Sender<P2pEvent>, running: &AtomicBool) {
         log::info!("Event monitor starting on group interface {group_interface}");
 
-        // Resolve the group interface object; retry briefly since GroupStarted
-        // and GroupAdd completion can race the interface's bus registration.
-        let iface_obj = {
-            let mut found = None;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if let Ok(o) = self.find_interface_by_name(group_interface) {
-                    found = Some(o);
-                    break;
-                }
-                if !running.load(Ordering::SeqCst) {
-                    log::info!("Event monitor thread exiting");
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            match found {
-                Some(o) => o,
-                None => {
-                    let msg = format!("group interface {group_interface} not found on D-Bus");
-                    log::error!("Failed to start event monitor: {msg}");
-                    let _ = tx.send(P2pEvent::Error(msg));
-                    return;
-                }
+        // The group interface has no D-Bus Interface object (verified live);
+        // P2P peer signals for the GO are emitted on the PARENT P2P device
+        // object. Resolve that (cached).
+        let iface_obj = match self.ensure_device_obj() {
+            Ok((_, obj)) => obj,
+            Err(e) => {
+                let msg = format!("event monitor: parent device object unavailable: {e}");
+                log::error!("Failed to start event monitor: {msg}");
+                let _ = tx.send(P2pEvent::Error(msg));
+                return;
             }
         };
 
@@ -425,10 +411,17 @@ enum SignalKind {
 type SignalMsg = (SignalKind, zbus::Message);
 
 impl DbusBackend {
-    /// One WPS.Start attempt on the group interface's WPS object.
-    fn arm_wps_pin_once(&self, group_interface: &str, pin: &str) -> BackendResult<()> {
-        let iface_obj = self.find_interface_by_name(group_interface)?;
-        let wps = self.proxy_at(&iface_obj, IFACE_WPS)?;
+    /// One WPS.Start attempt to arm the registrar for the P2P GO.
+    ///
+    /// NOTE: the P2P *group* interface has NO `fi.w1.wpa_supplicant1.Interface`
+    /// object (verified live — the Interfaces list only holds the physical
+    /// devices). Over D-Bus, WPS arming for an autonomous GO happens on the
+    /// PARENT P2P device's WPS object, not on a per-group object as the wpa_cli
+    /// `-i <group>` model implies. `group_interface` is accepted for API
+    /// symmetry with the CLI backend but not used to resolve the object.
+    fn arm_wps_pin_once(&self, _group_interface: &str, pin: &str) -> BackendResult<()> {
+        let (_ifname, dev_obj) = self.ensure_device_obj()?;
+        let wps = self.proxy_at(&dev_obj, IFACE_WPS)?;
         let mut args: HashMap<&str, Value> = HashMap::new();
         args.insert("Role", Value::from("registrar"));
         args.insert("Type", Value::from("pin"));
