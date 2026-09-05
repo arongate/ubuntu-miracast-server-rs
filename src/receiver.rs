@@ -1079,6 +1079,42 @@ impl SessionCtx {
             }
         }
 
+        // Caps probe on the decoder src pad: log the NEGOTIATED decoded
+        // resolution (proves the source is sending HD, not upscaled 640x480),
+        // populate state.resolution (previously always 0x0), and emit
+        // ResolutionChanged for the UI.
+        if let Some(dec) = pipeline.by_name("videodec") {
+            if let Some(src_pad) = dec.static_pad("src") {
+                let state = Arc::clone(&self.state);
+                let events = self.events.clone();
+                src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+                    if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+                        if let gst::EventView::Caps(c) = ev.view() {
+                            let caps = c.caps();
+                            if let Some(s) = caps.structure(0) {
+                                if let (Ok(w), Ok(h)) =
+                                    (s.get::<i32>("width"), s.get::<i32>("height"))
+                                {
+                                    let (w, h) = (w as u32, h as u32);
+                                    let mut cur = state.resolution.lock_safe();
+                                    if *cur != (w, h) {
+                                        *cur = (w, h);
+                                        drop(cur);
+                                        log::info!("Negotiated video resolution: {w}x{h}");
+                                        let _ = events.send(Event::ResolutionChanged {
+                                            width: w,
+                                            height: h,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            }
+        }
+
         *self.pipeline.lock_safe() = Some(pipeline);
 
         // Stats monitor thread.

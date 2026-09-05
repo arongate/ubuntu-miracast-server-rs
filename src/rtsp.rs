@@ -328,11 +328,16 @@ pub struct WfdVideoFormat {
 impl Default for WfdVideoFormat {
     fn default() -> Self {
         Self {
-            native_index: 0,
+            native_index: 0x38, // native/preferred = 1920x1080@30p
+            // (WFD native = (cea_index << 3) | table; CEA index 7 = 1080p30).
+            // The original port advertised native_index=0 (= 640x480@60p),
+            // which made sources stream 640x480 upscaled → blurry. See
+            // PORT_NOTES: a deliberate deviation from the byte-identical Python
+            // string to fix a latent upstream quality limitation.
             preferred_display_mode: 0,
             profile: 0x02,          // CHP
             level: 0x10,            // Level 4.2
-            cea_bitmap: 0x0001DEFF, // Standard supported resolutions
+            cea_bitmap: 0x0001DFFF, // Standard resolutions + bit8 = 1920x1080@60p
             vesa_bitmap: 0x0000_0000,
             hh_bitmap: 0x0000_0000,
             latency: 0,
@@ -624,11 +629,14 @@ mod tests {
 
     #[test]
     fn video_format_default_wfd_string() {
-        // Byte-exact against the Python default WFDVideoFormat.to_wfd_string().
+        // Deliberate deviation from the Python default (which advertised
+        // native_index=0 = 640x480@60p, causing sources to stream upscaled
+        // 640x480). Now native=0x38 (1920x1080@30p) + cea_bitmap bit8
+        // (1920x1080@60p). See PORT_NOTES.
         let s = WfdVideoFormat::default().to_wfd_string();
         assert_eq!(
             s,
-            "00 00 02 10 0001DEFF 00000000 00000000 00 0000 0000 00 none none"
+            "38 00 02 10 0001DFFF 00000000 00000000 00 0000 0000 00 none none"
         );
     }
 
