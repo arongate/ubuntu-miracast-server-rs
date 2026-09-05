@@ -14,7 +14,6 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::gio;
-use gtk::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
