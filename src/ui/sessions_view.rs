@@ -7,10 +7,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::prelude::*;
-use libadwaita as adw;
 use adw::prelude::*;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use libadwaita as adw;
 
 use crate::history::ServerSessionHistory;
 use crate::models::ServerSessionRecord;
@@ -103,8 +103,7 @@ impl SessionsView {
             .spacing(8)
             .valign(gtk::Align::Center)
             .build();
-        let placeholder_icon =
-            gtk::Image::from_icon_name("document-open-recent-symbolic");
+        let placeholder_icon = gtk::Image::from_icon_name("document-open-recent-symbolic");
         placeholder_icon.set_pixel_size(48);
         placeholder_icon.add_css_class("dim-label");
         placeholder.append(&placeholder_icon);

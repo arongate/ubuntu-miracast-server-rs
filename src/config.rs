@@ -16,10 +16,26 @@ struct Rule {
 
 fn validation_rule(section: &str, key: &str) -> Option<Rule> {
     match (section, key) {
-        ("streaming", "rtsp_port") => Some(Rule { is_int: true, min: Some(1024), max: Some(65535) }),
-        ("network", "go_intent") => Some(Rule { is_int: true, min: Some(0), max: Some(15) }),
-        ("network", "connection_timeout") => Some(Rule { is_int: true, min: Some(1), max: Some(120) }),
-        ("network", "rtp_port") => Some(Rule { is_int: true, min: Some(1024), max: Some(65535) }),
+        ("streaming", "rtsp_port") => Some(Rule {
+            is_int: true,
+            min: Some(1024),
+            max: Some(65535),
+        }),
+        ("network", "go_intent") => Some(Rule {
+            is_int: true,
+            min: Some(0),
+            max: Some(15),
+        }),
+        ("network", "connection_timeout") => Some(Rule {
+            is_int: true,
+            min: Some(1),
+            max: Some(120),
+        }),
+        ("network", "rtp_port") => Some(Rule {
+            is_int: true,
+            min: Some(1024),
+            max: Some(65535),
+        }),
         _ => None,
     }
 }
@@ -144,12 +160,8 @@ impl ServerConfig {
         if rule.is_int {
             // Python isinstance(value, int) — reject bools and non-integers.
             let n = match value {
-                Value::Bool(_) => {
-                    return Err(format!("{section}.{key} must be int, got bool"))
-                }
-                Value::Number(num) if num.is_i64() || num.is_u64() => {
-                    num.as_i64().unwrap()
-                }
+                Value::Bool(_) => return Err(format!("{section}.{key} must be int, got bool")),
+                Value::Number(num) if num.is_i64() || num.is_u64() => num.as_i64().unwrap(),
                 other => {
                     return Err(format!(
                         "{section}.{key} must be int, got {}",
@@ -263,8 +275,7 @@ pub(crate) fn write_json_0600(path: &Path, value: &Value) -> std::io::Result<()>
     }
     let tmp_path = path.with_extension("tmp");
 
-    let serialized = serde_json::to_string_pretty(value)
-        .map_err(std::io::Error::other)?;
+    let serialized = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
 
     let write_result = (|| -> std::io::Result<()> {
         use std::io::Write;
@@ -315,7 +326,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let cfg = ServerConfig::new(Some(&path));
-        assert_eq!(cfg.get_str("general", "device_name", "x"), "Ubuntu Miracast Server");
+        assert_eq!(
+            cfg.get_str("general", "device_name", "x"),
+            "Ubuntu Miracast Server"
+        );
         assert_eq!(cfg.get_i64("streaming", "rtsp_port", 0), 7236);
         assert_eq!(cfg.get_i64("network", "rtp_port", 0), 1028);
         assert!(cfg.get_bool("streaming", "audio_enabled", false));

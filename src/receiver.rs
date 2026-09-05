@@ -52,7 +52,9 @@ const RTSP_BUFFER_SIZE: usize = 16384;
 
 fn validate_port(port: i64) -> Result<(), String> {
     if !(1024..=65535).contains(&port) {
-        return Err(format!("Port must be integer in range 1024-65535, got {port}"));
+        return Err(format!(
+            "Port must be integer in range 1024-65535, got {port}"
+        ));
     }
     Ok(())
 }
@@ -146,25 +148,55 @@ impl PipelineBuilder {
             pipeline.add(e).map_err(|e| format!("pipeline.add: {e}"))?;
         }
 
-        udpsrc.link(&rtpdepay).map_err(|e| format!("link udpsrc→rtpdepay: {e}"))?;
-        rtpdepay.link(&tsdemux).map_err(|e| format!("link rtpdepay→tsdemux: {e}"))?;
-        video_queue.link(&h264parse).map_err(|e| format!("link vq→h264parse: {e}"))?;
-        h264parse.link(&decoder).map_err(|e| format!("link h264parse→dec: {e}"))?;
-        decoder.link(&videoconvert).map_err(|e| format!("link dec→convert: {e}"))?;
-        videoconvert.link(&videosink).map_err(|e| format!("link convert→sink: {e}"))?;
+        udpsrc
+            .link(&rtpdepay)
+            .map_err(|e| format!("link udpsrc→rtpdepay: {e}"))?;
+        rtpdepay
+            .link(&tsdemux)
+            .map_err(|e| format!("link rtpdepay→tsdemux: {e}"))?;
+        video_queue
+            .link(&h264parse)
+            .map_err(|e| format!("link vq→h264parse: {e}"))?;
+        h264parse
+            .link(&decoder)
+            .map_err(|e| format!("link h264parse→dec: {e}"))?;
+        decoder
+            .link(&videoconvert)
+            .map_err(|e| format!("link dec→convert: {e}"))?;
+        videoconvert
+            .link(&videosink)
+            .map_err(|e| format!("link convert→sink: {e}"))?;
 
         // ── Audio branch (optional) ──
         let audio_queue_opt = if audio_enabled {
             let audio_queue = self.make_queue("audio_queue")?;
-            let aacparse = gst::ElementFactory::make("aacparse").name("aacparse").build().ok();
-            let audiodec = gst::ElementFactory::make("avdec_aac").name("audiodec").build().ok();
-            let audioconvert =
-                gst::ElementFactory::make("audioconvert").name("audioconvert").build().ok();
-            let mut audiosink = gst::ElementFactory::make("pulsesink").name("audiosink").build().ok();
+            let aacparse = gst::ElementFactory::make("aacparse")
+                .name("aacparse")
+                .build()
+                .ok();
+            let audiodec = gst::ElementFactory::make("avdec_aac")
+                .name("audiodec")
+                .build()
+                .ok();
+            let audioconvert = gst::ElementFactory::make("audioconvert")
+                .name("audioconvert")
+                .build()
+                .ok();
+            let mut audiosink = gst::ElementFactory::make("pulsesink")
+                .name("audiosink")
+                .build()
+                .ok();
 
-            if aacparse.is_none() || audiodec.is_none() || audioconvert.is_none() || audiosink.is_none() {
+            if aacparse.is_none()
+                || audiodec.is_none()
+                || audioconvert.is_none()
+                || audiosink.is_none()
+            {
                 // Fallback: autoaudiosink.
-                audiosink = gst::ElementFactory::make("autoaudiosink").name("audiosink").build().ok();
+                audiosink = gst::ElementFactory::make("autoaudiosink")
+                    .name("audiosink")
+                    .build()
+                    .ok();
                 if audiosink.is_none() {
                     log::warn!("No audio sink available, disabling audio");
                     audio_enabled = false;
@@ -176,14 +208,30 @@ impl PipelineBuilder {
                 let audiodec = audiodec.unwrap();
                 let audioconvert = audioconvert.unwrap();
                 let audiosink = audiosink.unwrap();
-                for e in [&audio_queue, &aacparse, &audiodec, &audioconvert, &audiosink] {
-                    pipeline.add(e).map_err(|e| format!("pipeline.add audio: {e}"))?;
+                for e in [
+                    &audio_queue,
+                    &aacparse,
+                    &audiodec,
+                    &audioconvert,
+                    &audiosink,
+                ] {
+                    pipeline
+                        .add(e)
+                        .map_err(|e| format!("pipeline.add audio: {e}"))?;
                     elems.push(e.clone());
                 }
-                audio_queue.link(&aacparse).map_err(|e| format!("link aq→aacparse: {e}"))?;
-                aacparse.link(&audiodec).map_err(|e| format!("link aacparse→dec: {e}"))?;
-                audiodec.link(&audioconvert).map_err(|e| format!("link adec→conv: {e}"))?;
-                audioconvert.link(&audiosink).map_err(|e| format!("link aconv→sink: {e}"))?;
+                audio_queue
+                    .link(&aacparse)
+                    .map_err(|e| format!("link aq→aacparse: {e}"))?;
+                aacparse
+                    .link(&audiodec)
+                    .map_err(|e| format!("link aacparse→dec: {e}"))?;
+                audiodec
+                    .link(&audioconvert)
+                    .map_err(|e| format!("link adec→conv: {e}"))?;
+                audioconvert
+                    .link(&audiosink)
+                    .map_err(|e| format!("link aconv→sink: {e}"))?;
                 Some(audio_queue)
             } else {
                 None
@@ -239,9 +287,7 @@ impl PipelineBuilder {
         if use_hw {
             for hw in ["vaapidecodebin", "nvh264dec"] {
                 if gst::ElementFactory::find(hw).is_some() {
-                    if let Ok(dec) =
-                        gst::ElementFactory::make(hw).name("videodec").build()
-                    {
+                    if let Ok(dec) = gst::ElementFactory::make(hw).name("videodec").build() {
                         log::info!("Using hardware decoder: {hw}");
                         return Ok(dec);
                     }
@@ -520,10 +566,16 @@ impl SessionCtx {
         let mut sock = self
             .connect_to_source()
             .ok_or_else(|| "RTSP connect aborted".to_string())?;
-        log::info!("RTSP connected to source {}:{}", self.source_ip, self.rtsp_port);
+        log::info!(
+            "RTSP connected to source {}:{}",
+            self.source_ip,
+            self.rtsp_port
+        );
 
         // M1: Source OPTIONS → we reply.
-        let data = self.recv_message(&mut sock).ok_or("No M1 received from source")?;
+        let data = self
+            .recv_message(&mut sock)
+            .ok_or("No M1 received from source")?;
         log::info!("M1 received");
         let m1_cseq = parse_cseq(&data);
         let m1 = format!(
@@ -535,10 +587,13 @@ impl SessionCtx {
         cseq += 1;
         let m2 = format!("OPTIONS * RTSP/1.0\r\nCSeq: {cseq}\r\nRequire: org.wfa.wfd1.0\r\n\r\n");
         sock.write_all(m2.as_bytes()).map_err(oserr)?;
-        self.recv_message(&mut sock).ok_or("No M2 response from source")?;
+        self.recv_message(&mut sock)
+            .ok_or("No M2 response from source")?;
 
         // M3: Source GET_PARAMETER → we reply with capabilities.
-        let data = self.recv_message(&mut sock).ok_or("No M3 received from source")?;
+        let data = self
+            .recv_message(&mut sock)
+            .ok_or("No M3 received from source")?;
         log::info!("M3 received (capability query)");
         let m3_cseq = parse_cseq(&data);
         let body = self.build_capability_body(&data);
@@ -549,7 +604,9 @@ impl SessionCtx {
         sock.write_all(m3.as_bytes()).map_err(oserr)?;
 
         // M4: Source SET_PARAMETER (chosen params) → OK.
-        let data = self.recv_message(&mut sock).ok_or("No M4 received from source")?;
+        let data = self
+            .recv_message(&mut sock)
+            .ok_or("No M4 received from source")?;
         log::info!("M4 received (parameters set)");
         let m4_cseq = parse_cseq(&data);
         self.parse_m4_params(&data);
@@ -557,7 +614,9 @@ impl SessionCtx {
         sock.write_all(m4.as_bytes()).map_err(oserr)?;
 
         // M5: Source SET_PARAMETER (trigger SETUP) → OK.
-        let data = self.recv_message(&mut sock).ok_or("No M5 received from source")?;
+        let data = self
+            .recv_message(&mut sock)
+            .ok_or("No M5 received from source")?;
         log::info!("M5 received (trigger SETUP)");
         let m5_cseq = parse_cseq(&data);
         let m5 = format!("RTSP/1.0 200 OK\r\nCSeq: {m5_cseq}\r\n\r\n");
@@ -571,7 +630,9 @@ impl SessionCtx {
             self.source_ip
         );
         sock.write_all(m6.as_bytes()).map_err(oserr)?;
-        let data = self.recv_message(&mut sock).ok_or("No M6 response from source")?;
+        let data = self
+            .recv_message(&mut sock)
+            .ok_or("No M6 response from source")?;
         let session_id = parse_session_id(&data);
         let server_port = parse_server_port(&data);
         log::info!("Session: {session_id}, server_port: {server_port}");
@@ -586,7 +647,8 @@ impl SessionCtx {
             self.source_ip
         );
         sock.write_all(m7.as_bytes()).map_err(oserr)?;
-        self.recv_message(&mut sock).ok_or("No M7 response from source")?;
+        self.recv_message(&mut sock)
+            .ok_or("No M7 response from source")?;
         log::info!("M7 response received — streaming active!");
 
         let _ = self.events.send(Event::StreamStarted);
@@ -603,15 +665,15 @@ impl SessionCtx {
         let mut attempt = 0;
         while self.state.running.load(Ordering::SeqCst) && Instant::now() < deadline {
             attempt += 1;
-            match addr.parse().ok().and_then(|sa| {
-                TcpStream::connect_timeout(&sa, Duration::from_secs(5)).ok()
-            }) {
+            match addr
+                .parse()
+                .ok()
+                .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_secs(5)).ok())
+            {
                 Some(sock) => {
                     let _ = sock.set_nodelay(true);
                     let _ = sock.set_read_timeout(Some(RTSP_RECV_TIMEOUT));
-                    log::info!(
-                        "Connected to source RTSP server {addr} (attempt {attempt})"
-                    );
+                    log::info!("Connected to source RTSP server {addr} (attempt {attempt})");
                     return Some(sock);
                 }
                 None => {
@@ -621,9 +683,8 @@ impl SessionCtx {
             }
         }
         if self.state.running.load(Ordering::SeqCst) {
-            let msg = format!(
-                "Failed to connect to source RTSP at {addr} after {attempt} attempts"
-            );
+            let msg =
+                format!("Failed to connect to source RTSP at {addr} after {attempt} attempts");
             log::error!("{msg}");
             let _ = self.events.send(Event::StreamError(msg));
         }
@@ -725,9 +786,8 @@ impl SessionCtx {
     /// Build the M3 capability response body (matches lazycast's working values).
     fn build_capability_body(&self, m3_data: &str) -> String {
         let rtp_port = self.rtp_port.load(Ordering::SeqCst);
-        let mut msg = format!(
-            "wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n"
-        );
+        let mut msg =
+            format!("wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n");
         msg.push_str("wfd_audio_codecs: AAC 00000001 00\r\n");
         msg.push_str("wfd_video_formats: 00 00 02 10 0001FEFF 3FFFFFFF 00000FFF 00 0000 0000 00 none none\r\n");
         msg.push_str("wfd_3d_video_formats: none\r\n");
@@ -914,12 +974,9 @@ impl StatsCtx {
         let mut last_bytes: u64 = 0;
         let mut frame_history: Vec<(Instant, i64, i64)> = Vec::new();
 
-        while self.state.running.load(Ordering::SeqCst)
-            && self.pipeline.lock().unwrap().is_some()
-        {
+        while self.state.running.load(Ordering::SeqCst) && self.pipeline.lock().unwrap().is_some() {
             std::thread::sleep(STATS_INTERVAL);
-            if !self.state.running.load(Ordering::SeqCst)
-                || self.pipeline.lock().unwrap().is_none()
+            if !self.state.running.load(Ordering::SeqCst) || self.pipeline.lock().unwrap().is_none()
             {
                 break;
             }
@@ -951,8 +1008,7 @@ impl StatsCtx {
                 let decoded_delta = last.1 - first.1;
                 let dropped_delta = last.2 - first.2;
                 if decoded_delta > 0 {
-                    let drop_rate =
-                        dropped_delta as f64 / (decoded_delta + dropped_delta) as f64;
+                    let drop_rate = dropped_delta as f64 / (decoded_delta + dropped_delta) as f64;
                     if drop_rate > FRAME_DROP_WARNING_THRESHOLD {
                         log::warn!(
                             "Frame drop rate {:.1}% exceeds threshold",
@@ -1060,7 +1116,10 @@ mod tests {
             parse_session_id("RTSP/1.0 200 OK\r\nSession: 1234ABCD;timeout=30\r\n\r\n"),
             "1234ABCD"
         );
-        assert_eq!(parse_session_id("RTSP/1.0 200 OK\r\nSession: 55\r\n\r\n"), "55");
+        assert_eq!(
+            parse_session_id("RTSP/1.0 200 OK\r\nSession: 55\r\n\r\n"),
+            "55"
+        );
         assert_eq!(parse_session_id("no session"), "0");
     }
 

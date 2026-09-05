@@ -163,9 +163,11 @@ impl MiracastAdvertiser {
         // Step 5: Set WFD subelements on the group interface too (best-effort).
         if let Err(e) = self.wpa(&["set", "wifi_display", "1"], Some(&group_iface), false) {
             log::debug!("Could not set WFD on group iface (may not be needed): {e}");
-        } else if let Err(e) =
-            self.wpa(&["wfd_subelem_set", "0", &dev_info], Some(&group_iface), false)
-        {
+        } else if let Err(e) = self.wpa(
+            &["wfd_subelem_set", "0", &dev_info],
+            Some(&group_iface),
+            false,
+        ) {
             log::debug!("Could not set WFD on group iface (may not be needed): {e}");
         }
 

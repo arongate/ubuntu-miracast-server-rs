@@ -12,11 +12,11 @@
 
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::prelude::*;
-use gtk::gio;
-use libadwaita as adw;
 use adw::prelude::*;
+use gtk::gio;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use libadwaita as adw;
 
 use crate::ui::display_view::DisplayView;
 use crate::ui::sessions_view::SessionsView;
@@ -149,22 +149,20 @@ impl MainWindow {
         // Window-level F11 / Escape fullscreen handling (NFR-U03).
         let key_ctrl = gtk::EventControllerKey::new();
         let win = window.clone();
-        key_ctrl.connect_key_pressed(move |_, keyval, _, _| {
-            match keyval {
-                gtk::gdk::Key::F11 => {
-                    if win.is_fullscreen() {
-                        win.unfullscreen();
-                    } else {
-                        win.fullscreen();
-                    }
-                    gtk::glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Escape if win.is_fullscreen() => {
+        key_ctrl.connect_key_pressed(move |_, keyval, _, _| match keyval {
+            gtk::gdk::Key::F11 => {
+                if win.is_fullscreen() {
                     win.unfullscreen();
-                    gtk::glib::Propagation::Stop
+                } else {
+                    win.fullscreen();
                 }
-                _ => gtk::glib::Propagation::Proceed,
+                gtk::glib::Propagation::Stop
             }
+            gtk::gdk::Key::Escape if win.is_fullscreen() => {
+                win.unfullscreen();
+                gtk::glib::Propagation::Stop
+            }
+            _ => gtk::glib::Propagation::Proceed,
         });
         window.add_controller(key_ctrl);
     }

@@ -12,9 +12,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4 as gtk;
 use gtk::glib;
 use gtk::prelude::*;
+use gtk4 as gtk;
 
 use crate::events::StreamStats;
 
@@ -291,12 +291,14 @@ impl DisplayView {
     /// Transition to idle state.
     pub fn set_state_idle(&self, device_name: &str) {
         *self.state.borrow_mut() = DisplayState::Idle;
-        self.device_name_label.set_text(if device_name.is_empty() {
-            String::new()
-        } else {
-            format!("Discoverable as: {device_name}")
-        }
-        .as_str());
+        self.device_name_label.set_text(
+            if device_name.is_empty() {
+                String::new()
+            } else {
+                format!("Discoverable as: {device_name}")
+            }
+            .as_str(),
+        );
         self.stack.set_visible_child_name(DisplayState::Idle.name());
         self.stats_revealer.set_reveal_child(false);
         self.controls_revealer.set_reveal_child(false);

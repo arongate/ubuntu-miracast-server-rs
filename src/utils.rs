@@ -162,9 +162,8 @@ pub fn run_wpa_cli(
         cmd.arg(a);
     }
 
-    let output = run_with_timeout(&mut cmd, Duration::from_secs(10)).map_err(|e| {
-        WpaError::Runtime(format!("Failed to execute wpa_cli: {e}"))
-    })?;
+    let output = run_with_timeout(&mut cmd, Duration::from_secs(10))
+        .map_err(|e| WpaError::Runtime(format!("Failed to execute wpa_cli: {e}")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -205,8 +204,7 @@ pub fn list_p2p_interfaces() -> Vec<InterfaceInfo> {
 
     // Method 2: NetworkManager wifi-p2p devices.
     if let Ok(out) = run_with_timeout(
-        Command::new("nmcli")
-            .args(["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]),
+        Command::new("nmcli").args(["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"]),
         Duration::from_secs(5),
     ) {
         if out.status.success() {
@@ -244,8 +242,7 @@ fn get_interface_info(iface_name: &str, parent: &str) -> InterfaceInfo {
 
     let mut status = "available".to_string();
     if let Ok(out) = run_with_timeout(
-        Command::new("nmcli")
-            .args(["-t", "-f", "DEVICE,STATE", "device", "status"]),
+        Command::new("nmcli").args(["-t", "-f", "DEVICE,STATE", "device", "status"]),
         Duration::from_secs(5),
     ) {
         if out.status.success() {
@@ -320,8 +317,7 @@ pub fn find_p2p_interface() -> Result<(String, String), WpaError> {
         let mut fallback: Option<(String, String)> = None;
         for (p2p_iface, parent) in &p2p_dev {
             match run_with_timeout(
-                Command::new("sudo")
-                    .args(["wpa_cli", "-i", parent, "status"]),
+                Command::new("sudo").args(["wpa_cli", "-i", parent, "status"]),
                 Duration::from_secs(5),
             ) {
                 Ok(status) if status.status.success() => {
@@ -392,10 +388,7 @@ fn probe_realtek_p2p(wifi_iface: &str) -> bool {
 /// Rust's std has no built-in timeout, so we spawn and poll; on timeout we kill
 /// the child and return an error, matching the Python TimeoutExpired handling
 /// (callers treat any error as "command unavailable/failed").
-fn run_with_timeout(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> std::io::Result<std::process::Output> {
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;

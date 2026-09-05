@@ -187,9 +187,8 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
     let config = ServerConfig::new(None);
     let mut history = ServerSessionHistory::new(None);
 
-    let name = device_name.unwrap_or_else(|| {
-        config.get_str("general", "device_name", "Ubuntu Miracast Server")
-    });
+    let name = device_name
+        .unwrap_or_else(|| config.get_str("general", "device_name", "Ubuntu Miracast Server"));
     let rtsp_port = config.get_i64("streaming", "rtsp_port", 7236) as u16;
     let rtp_port = config.get_i64("network", "rtp_port", 1028);
     let go_intent = config.get_i64("network", "go_intent", 15) as i32;
@@ -199,15 +198,14 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
     let idle_timeout = config.get_i64("service", "idle_timeout", 0);
 
     // Determine P2P interface: CLI flag > config > auto-detect.
-    let iface = p2p_interface
-        .or_else(|| {
-            let c = config.get_str("network", "p2p_interface", "");
-            if c.is_empty() {
-                None
-            } else {
-                Some(c)
-            }
-        });
+    let iface = p2p_interface.or_else(|| {
+        let c = config.get_str("network", "p2p_interface", "");
+        if c.is_empty() {
+            None
+        } else {
+            Some(c)
+        }
+    });
 
     log::info!(
         "Starting service mode as '{}' (RTSP port {}, interface={})",
@@ -353,7 +351,9 @@ mod tests {
 
     #[test]
     fn service_template_byte_identical() {
-        assert!(SERVICE_TEMPLATE.contains("Description=Ubuntu Miracast Server (Wi-Fi Display Sink)"));
+        assert!(
+            SERVICE_TEMPLATE.contains("Description=Ubuntu Miracast Server (Wi-Fi Display Sink)")
+        );
         assert!(SERVICE_TEMPLATE.contains("ExecStart=/usr/bin/ubuntu-miracast-server --service"));
         assert!(SERVICE_TEMPLATE.contains("Restart=on-failure"));
         assert!(SERVICE_TEMPLATE.contains("RestartSec=5"));

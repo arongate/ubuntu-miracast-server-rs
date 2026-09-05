@@ -8,10 +8,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::glib;
-use gtk::prelude::*;
-use libadwaita as adw;
 use crate::advertiser::MiracastAdvertiser;
 use crate::config::ServerConfig;
 use crate::connection::ConnectionHandler;
@@ -20,6 +16,10 @@ use crate::history::ServerSessionHistory;
 use crate::p2p_supplicant::P2PSupplicantManager;
 use crate::receiver::MiracastReceiver;
 use crate::ui::main_window::MainWindow;
+use gtk::glib;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use libadwaita as adw;
 
 /// Shared, single-threaded application state (GTK is single-threaded; all of
 /// this lives on the main loop, so `Rc<RefCell<..>>` is the right tool).
@@ -99,7 +99,10 @@ fn activate(
     // adapter can stay on Wi-Fi (internet) while the secondary handles P2P.
     let p2p_supplicant = start_dedicated_supplicant(&p2p_interface, &device_name);
     let (effective_interface, ctrl_path) = match &p2p_supplicant {
-        Some(s) => (Some(s.interface().to_string()), Some(s.ctrl_path().to_string())),
+        Some(s) => (
+            Some(s.interface().to_string()),
+            Some(s.ctrl_path().to_string()),
+        ),
         None => (None, None),
     };
 
@@ -108,7 +111,9 @@ fn activate(
     let advertiser = Rc::new(RefCell::new(MiracastAdvertiser::new(
         device_name.clone(),
         rtsp_port,
-        effective_interface.clone().or_else(|| p2p_interface.clone()),
+        effective_interface
+            .clone()
+            .or_else(|| p2p_interface.clone()),
         ctrl_path.clone(),
         tx.clone(),
     )));
@@ -320,11 +325,15 @@ fn switch_interface(state: &Rc<App>, new_interface: String) {
     }
     *state.connection_handler.borrow_mut() = None;
 
-    state.advertiser.borrow_mut().set_p2p_interface(&new_interface);
-    let _ = state
-        .config
+    state
+        .advertiser
         .borrow_mut()
-        .set("network", "p2p_interface", serde_json::json!(new_interface));
+        .set_p2p_interface(&new_interface);
+    let _ =
+        state
+            .config
+            .borrow_mut()
+            .set("network", "p2p_interface", serde_json::json!(new_interface));
 
     state.advertiser.borrow_mut().start_advertising();
     log::info!("Interface switched to {new_interface} — restarting advertising");

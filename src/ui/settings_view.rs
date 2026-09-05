@@ -10,10 +10,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4 as gtk;
-use gtk::prelude::*;
-use libadwaita as adw;
 use adw::prelude::*;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use libadwaita as adw;
 
 use serde_json::json;
 
@@ -103,20 +103,28 @@ impl SettingsView {
             "general",
             "start_minimized",
         ));
-        general.add(&self.switch_row(
-            "Fullscreen on Stream",
-            Some("Automatically enter fullscreen when stream starts"),
-            cfg.borrow().get_bool("general", "fullscreen_on_stream", true),
-            "general",
-            "fullscreen_on_stream",
-        ));
+        general.add(
+            &self.switch_row(
+                "Fullscreen on Stream",
+                Some("Automatically enter fullscreen when stream starts"),
+                cfg.borrow()
+                    .get_bool("general", "fullscreen_on_stream", true),
+                "general",
+                "fullscreen_on_stream",
+            ),
+        );
 
         // Log level combo.
         let log_levels = ["DEBUG", "INFO", "WARNING", "ERROR"];
         let log_row = adw::ComboRow::builder().title("Log Level").build();
         log_row.set_model(Some(&gtk::StringList::new(&log_levels)));
         let current_level = cfg.borrow().get_str("general", "log_level", "INFO");
-        log_row.set_selected(log_levels.iter().position(|l| *l == current_level).unwrap_or(1) as u32);
+        log_row.set_selected(
+            log_levels
+                .iter()
+                .position(|l| *l == current_level)
+                .unwrap_or(1) as u32,
+        );
         {
             let cfg = cfg.clone();
             log_row.connect_selected_notify(move |row| {
@@ -133,7 +141,11 @@ impl SettingsView {
         vbox.append(&streaming);
 
         let rtsp_row = adw::EntryRow::builder().title("RTSP Port").build();
-        rtsp_row.set_text(&cfg.borrow().get_i64("streaming", "rtsp_port", 7236).to_string());
+        rtsp_row.set_text(
+            &cfg.borrow()
+                .get_i64("streaming", "rtsp_port", 7236)
+                .to_string(),
+        );
         {
             let cfg = cfg.clone();
             rtsp_row.connect_changed(move |row| {
@@ -141,7 +153,11 @@ impl SettingsView {
                 match text.parse::<i64>() {
                     Ok(port) => {
                         // set() validates the 1024-65535 range; flag on rejection.
-                        if cfg.borrow_mut().set("streaming", "rtsp_port", json!(port)).is_err() {
+                        if cfg
+                            .borrow_mut()
+                            .set("streaming", "rtsp_port", json!(port))
+                            .is_err()
+                        {
                             row.add_css_class("error");
                         } else {
                             row.remove_css_class("error");
@@ -164,14 +180,23 @@ impl SettingsView {
         let resolutions = ["1920x1080", "1280x720", "640x480"];
         let res_row = adw::ComboRow::builder().title("Max Resolution").build();
         res_row.set_model(Some(&gtk::StringList::new(&resolutions)));
-        let current_res = cfg.borrow().get_str("streaming", "max_resolution", "1920x1080");
-        res_row.set_selected(resolutions.iter().position(|r| *r == current_res).unwrap_or(0) as u32);
+        let current_res = cfg
+            .borrow()
+            .get_str("streaming", "max_resolution", "1920x1080");
+        res_row.set_selected(
+            resolutions
+                .iter()
+                .position(|r| *r == current_res)
+                .unwrap_or(0) as u32,
+        );
         {
             let cfg = cfg.clone();
             res_row.connect_selected_notify(move |row| {
                 let idx = row.selected() as usize;
                 if let Some(res) = resolutions.get(idx) {
-                    let _ = cfg.borrow_mut().set("streaming", "max_resolution", json!(res));
+                    let _ = cfg
+                        .borrow_mut()
+                        .set("streaming", "max_resolution", json!(res));
                 }
             });
         }
@@ -191,7 +216,9 @@ impl SettingsView {
         let current_iface = cfg.borrow().get_str("network", "p2p_interface", "");
         {
             let values = self.interface_values.borrow();
-            let sel = values.iter().position(|v| *v == current_iface && !current_iface.is_empty());
+            let sel = values
+                .iter()
+                .position(|v| *v == current_iface && !current_iface.is_empty());
             self.interface_row.set_selected(sel.unwrap_or(0) as u32);
         }
         {
@@ -202,7 +229,9 @@ impl SettingsView {
                 let idx = row.selected() as usize;
                 let values = values.borrow();
                 if let Some(new_iface) = values.get(idx) {
-                    let _ = cfg.borrow_mut().set("network", "p2p_interface", json!(new_iface));
+                    let _ = cfg
+                        .borrow_mut()
+                        .set("network", "p2p_interface", json!(new_iface));
                     if let Some(cb) = hook.borrow().as_ref() {
                         cb(new_iface.clone());
                     }
@@ -240,7 +269,9 @@ impl SettingsView {
                 }
                 let current = cfg.borrow().get_str("network", "p2p_interface", "");
                 let values_b = values.borrow();
-                let sel = values_b.iter().position(|v| *v == current && !current.is_empty());
+                let sel = values_b
+                    .iter()
+                    .position(|v| *v == current && !current.is_empty());
                 row.set_selected(sel.unwrap_or(0) as u32);
             });
         }
@@ -277,7 +308,9 @@ impl SettingsView {
         ));
 
         // ── Service Mode ──
-        let service = adw::PreferencesGroup::builder().title("Service Mode").build();
+        let service = adw::PreferencesGroup::builder()
+            .title("Service Mode")
+            .build();
         vbox.append(&service);
         service.add(&self.switch_row(
             "Enable Service Mode",

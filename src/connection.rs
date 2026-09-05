@@ -207,10 +207,7 @@ fn arm_wps_pin(shared: &Arc<Shared>) {
     for attempt in 0..10 {
         match run_wpa_cli(&group, &["wps_pin", "any", &pin], false, ctrl.as_deref()) {
             Ok(result) if !result.contains("FAIL") => {
-                log::info!(
-                    "WPS PIN armed: {pin} on {group} (attempt {})",
-                    attempt + 1
-                );
+                log::info!("WPS PIN armed: {pin} on {group} (attempt {})", attempt + 1);
                 return;
             }
             Ok(_) => log::debug!("wps_pin attempt {} failed, retrying...", attempt + 1),
@@ -226,7 +223,12 @@ fn arm_wps_pin(shared: &Arc<Shared>) {
 
 /// Monitor the GROUP interface for AP-STA-CONNECTED events.
 fn event_monitor_loop(shared: Arc<Shared>) {
-    let group = shared.group_interface.lock().unwrap().clone().unwrap_or_default();
+    let group = shared
+        .group_interface
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_default();
     let ctrl = shared.ctrl_path.lock().unwrap().clone();
     log::info!("Event monitor starting on group interface {group}");
 
@@ -266,9 +268,10 @@ fn event_monitor_loop(shared: Arc<Shared>) {
             })
             .unwrap_or_default();
         log::error!("wpa_cli exited immediately: {}", stderr.trim());
-        let _ = shared
-            .events
-            .send(Event::ConnectionError(format!("wpa_cli failed: {}", stderr.trim())));
+        let _ = shared.events.send(Event::ConnectionError(format!(
+            "wpa_cli failed: {}",
+            stderr.trim()
+        )));
         return;
     }
 
@@ -324,7 +327,9 @@ fn event_monitor_loop(shared: Arc<Shared>) {
             continue;
         }
 
-        if line.contains("AP-STA") || line.contains("P2P") || line.contains("WPS")
+        if line.contains("AP-STA")
+            || line.contains("P2P")
+            || line.contains("WPS")
             || line.contains("CTRL")
         {
             log::info!("GO event: {line}");
@@ -336,7 +341,12 @@ fn event_monitor_loop(shared: Arc<Shared>) {
             continue;
         }
         if line.contains("WPS-PIN-NEEDED") {
-            let pin = shared.current_pin.lock().unwrap().clone().unwrap_or_default();
+            let pin = shared
+                .current_pin
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default();
             log::warn!("WPS-PIN-NEEDED: re-arming PIN {pin}");
             arm_wps_pin(&shared);
             continue;
@@ -368,9 +378,7 @@ fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
     // Wait for DHCP lease (up to 15s), else fall back to the first range IP.
     let peer_ip = wait_for_dhcp_lease(shared, peer_mac, group, Duration::from_secs(15))
         .unwrap_or_else(|| {
-            log::warn!(
-                "Could not find DHCP lease for {peer_mac}, using {FALLBACK_PEER_IP}"
-            );
+            log::warn!("Could not find DHCP lease for {peer_mac}, using {FALLBACK_PEER_IP}");
             FALLBACK_PEER_IP.to_string()
         });
     log::info!("Source {peer_mac} got IP {peer_ip}");

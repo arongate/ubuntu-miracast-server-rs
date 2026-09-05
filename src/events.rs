@@ -17,7 +17,9 @@ use std::sync::mpsc::{Receiver, Sender};
 #[derive(Debug, Clone)]
 pub enum Event {
     // ── MiracastAdvertiser ──
-    AdvertisingStarted { group_interface: String },
+    AdvertisingStarted {
+        group_interface: String,
+    },
     AdvertisingStopped,
     AdvertisingError(String),
 
@@ -26,14 +28,20 @@ pub enum Event {
     ConnectionLost,
     ConnectionError(String),
     /// (pin, peer_info)
-    PinDisplay { pin: String, peer_info: String },
+    PinDisplay {
+        pin: String,
+        peer_info: String,
+    },
 
     // ── MiracastReceiver ──
     StreamStarted,
     StreamStopped(ReceiverStats),
     StreamError(String),
     StatsUpdated(StreamStats),
-    ResolutionChanged { width: u32, height: u32 },
+    ResolutionChanged {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Payload for `stats-updated` (Python emitted a dict; we use a struct).

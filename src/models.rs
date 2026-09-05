@@ -71,10 +71,7 @@ fn validate_group_interface(value: &str, field_name: &str) -> Result<(), Validat
     Ok(())
 }
 
-fn validate_connected_at(
-    value: DateTime<Local>,
-    field_name: &str,
-) -> Result<(), ValidationError> {
+fn validate_connected_at(value: DateTime<Local>, field_name: &str) -> Result<(), ValidationError> {
     let now = Local::now();
     let tolerance = Duration::seconds(1);
     if value > now + tolerance {
@@ -339,9 +336,7 @@ fn iso(dt: &DateTime<Local>) -> String {
 fn parse_iso(s: &str) -> Result<DateTime<Local>, ValidationError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Local))
-        .map_err(|e| {
-            ValidationError(format!("failed to deserialize ServerSessionRecord: {e}"))
-        })
+        .map_err(|e| ValidationError(format!("failed to deserialize ServerSessionRecord: {e}")))
 }
 
 fn as_string(v: &Value) -> String {

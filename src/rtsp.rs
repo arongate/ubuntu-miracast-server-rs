@@ -125,7 +125,11 @@ impl RtspResponse {
     /// ordered header list to `build_response`.
     pub fn serialize(&self) -> Vec<u8> {
         let mut lines: Vec<String> = Vec::new();
-        lines.push(format!("RTSP/1.0 {} {}", self.status_code, self.status_phrase()));
+        lines.push(format!(
+            "RTSP/1.0 {} {}",
+            self.status_code,
+            self.status_phrase()
+        ));
         lines.push(format!("CSeq: {}", self.cseq));
 
         for (key, value) in &self.headers {
@@ -199,7 +203,10 @@ pub fn parse_rtsp_request(data: &[u8]) -> Result<RtspRequest, RtspParseError> {
     let version = parts[2].to_string();
 
     let method = RtspMethod::from_str(method_str).ok_or_else(|| {
-        RtspParseError::with_code(format!("Unknown method: {method_str}"), RTSP_NOT_IMPLEMENTED)
+        RtspParseError::with_code(
+            format!("Unknown method: {method_str}"),
+            RTSP_NOT_IMPLEMENTED,
+        )
     })?;
 
     if !version.starts_with("RTSP/") {
@@ -295,8 +302,7 @@ pub fn build_options_response(cseq: i64) -> RtspResponse {
 
 /// Build an OPTIONS request from the sink to the source (M2).
 pub fn build_options_request(cseq: i64) -> Vec<u8> {
-    format!("OPTIONS * RTSP/1.0\r\nCSeq: {cseq}\r\nRequire: org.wfa.wfd1.0\r\n\r\n")
-        .into_bytes()
+    format!("OPTIONS * RTSP/1.0\r\nCSeq: {cseq}\r\nRequire: org.wfa.wfd1.0\r\n\r\n").into_bytes()
 }
 
 // ─── WFD Parameter Handling ───────────────────────────────────────────────────
@@ -381,7 +387,10 @@ impl Default for WfdAudioCodec {
 
 impl WfdAudioCodec {
     pub fn to_wfd_string(&self) -> String {
-        format!("{} {:08X} {:02X}", self.codec, self.modes_bitmap, self.latency)
+        format!(
+            "{} {:08X} {:02X}",
+            self.codec, self.modes_bitmap, self.latency
+        )
     }
 }
 
@@ -595,9 +604,7 @@ pub fn validate_request_size(data: &[u8]) -> Result<(), RtspParseError> {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
