@@ -83,18 +83,39 @@ GROUP_IFACE="$(grep -oE 'P2P GO active on [^ ]+' "$LOG" | tail -1 | awk '{print 
 ok "sink GO is up (group iface: ${GROUP_IFACE:-unknown})"
 
 # --- confirm the GO is on a 2.4GHz social channel ----------------------------
+# NOTE: `iw dev <p2p-go> info` does NOT print an operating channel line, so read
+# the frequency from the phy's in-use survey instead.
 if [ -n "${GROUP_IFACE:-}" ]; then
-  CH="$(iw dev "$GROUP_IFACE" info 2>/dev/null | awk '/channel/{print $2}')"
-  FREQ="$(iw dev "$GROUP_IFACE" info 2>/dev/null | grep -oE '\(([0-9]+) MHz\)' | grep -oE '[0-9]+' | head -1)"
-  say "GO channel=$CH freq=${FREQ}MHz"
-  case "$CH" in
-    1|6|11) ok "GO is on a 2.4GHz social channel ($CH) — phones scan here" ;;
-    *)      fail "GO is on channel $CH (${FREQ}MHz) — NOT a 2.4GHz social channel; a phone likely won't discover it" ;;
+  GO_WIPHY="$(iw dev "$GROUP_IFACE" info 2>/dev/null | awk '/wiphy/{print $2}')"
+  FREQ="$(iw dev "$GROUP_IFACE" survey dump 2>/dev/null \
+           | awk '/\[in use\]/{print $2}' | head -1)"
+  if [ -z "$FREQ" ]; then
+    # Fallback: scan the phy for our own BSS by the GO's MAC.
+    GO_MAC="$(iw dev "$GROUP_IFACE" info 2>/dev/null | awk '/addr/{print $2}')"
+    FREQ="$(iw dev "$GROUP_IFACE" scan dump 2>/dev/null | awk -v m="$GO_MAC" '
+            /^BSS/{bss=$2} /freq:/{f=$2} bss ~ m {print f; exit}')"
+  fi
+  say "GO wiphy=phy${GO_WIPHY} freq=${FREQ:-unknown}MHz"
+  case "$FREQ" in
+    2412|2437|2462) ok "GO is on a 2.4GHz social channel (${FREQ}MHz) — phones scan here" ;;
+    2*)             say "WARN: GO is on 2.4GHz ${FREQ}MHz but not a social channel (2412/2437/2462)" ;;
+    5*)             fail "GO is on 5GHz (${FREQ}MHz) — a phone will NOT discover it via P2P; force freq=2412" ;;
+    *)              say "NOTE: could not read GO frequency (P2P-GO exposes none via 'iw info'); relying on the scan below" ;;
   esac
 fi
 
 # --- scan from the observer for the sink as a P2P peer with a WFD IE ----------
 say "scanning from $OBSERVER_IFACE for the sink (p2p_find ${FIND_SECONDS}s) ..."
+# Trust check: if the observer shares the GO's physical radio, "discovered" is
+# NOT proof a phone (a separate radio) can find it — a radio always hears its
+# own GO. Warn loudly so a same-radio pass isn't mistaken for the real thing.
+OBS_WIPHY="$(iw dev "$OBSERVER_IFACE" info 2>/dev/null | awk '/wiphy/{print $2}')"
+if [ -n "${GO_WIPHY:-}" ] && [ "${OBS_WIPHY:-x}" = "${GO_WIPHY:-y}" ]; then
+  say "WARN: observer ($OBSERVER_IFACE) and the GO share phy${GO_WIPHY} — a same-radio"
+  say "      scan hears its own GO regardless of channel, so a PASS here is WEAK evidence."
+  say "      For a trustworthy result the GO must be on the idle adapter and 2.4GHz."
+fi
+
 wpa_cli -i "$OBSERVER_IFACE" set wifi_display 1 >/dev/null 2>&1
 wpa_cli -i "$OBSERVER_IFACE" p2p_find type=progressive >/dev/null 2>&1
 DISCOVERED=""

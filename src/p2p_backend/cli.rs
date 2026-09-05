@@ -126,6 +126,13 @@ impl P2pBackend for WpaCliBackend {
         self.wpa(&["p2p_find", "type=progressive"], None, true)?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
+        // Snapshot existing p2p-* netdevs BEFORE creating the group, so we can
+        // identify the one WE create and not latch onto a stale leftover.
+        let pre_existing = snapshot_group_interfaces();
+        if !pre_existing.is_empty() {
+            log::debug!("Pre-existing P2P group interfaces: {pre_existing:?}");
+        }
+
         // Create the autonomous GO on a 2.4GHz SOCIAL channel (freq=2412 = ch1).
         // Android/Miracast device discovery only probes the social channels
         // (1/6/11, 2.4GHz); a GO that lands on 5GHz (or gets auto-steered there)
@@ -146,11 +153,12 @@ impl P2pBackend for WpaCliBackend {
         }
         log::info!("p2p_group_add issued, waiting for group interface...");
 
-        let group_iface = wait_for_group_interface(Duration::from_secs(10)).ok_or_else(|| {
-            super::BackendError::Runtime(
-                "P2P group interface did not appear within 10 seconds".to_string(),
-            )
-        })?;
+        let group_iface = wait_for_group_interface(Duration::from_secs(10), &pre_existing)
+            .ok_or_else(|| {
+                super::BackendError::Runtime(
+                    "P2P group interface did not appear within 10 seconds".to_string(),
+                )
+            })?;
         log::info!("P2P GO created on interface: {group_iface}");
 
         // Best-effort: set WFD subelements on the group interface too.
@@ -352,14 +360,50 @@ impl P2pBackend for WpaCliBackend {
     }
 }
 
-/// Wait for the P2P group interface to appear after `p2p_group_add`.
-fn wait_for_group_interface(timeout: Duration) -> Option<String> {
+/// List ALL current `p2p-*` interface names from `ip link show`.
+pub(crate) fn list_group_interfaces(output: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for line in output.lines() {
+        if line.contains(": p2p-") {
+            let parts: Vec<&str> = line.split(": ").collect();
+            if parts.len() >= 2 {
+                let iface = parts[1].split('@').next().unwrap_or(parts[1]);
+                let iface = iface.trim_end_matches(':').trim();
+                if !iface.is_empty() {
+                    v.push(iface.to_string());
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Snapshot the set of `p2p-*` interfaces that exist RIGHT NOW. Call this
+/// immediately before `p2p_group_add` so `wait_for_group_interface` can tell the
+/// newly-created group from stale leftovers of a previous run.
+fn snapshot_group_interfaces() -> Vec<String> {
+    Command::new("ip")
+        .args(["link", "show"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| list_group_interfaces(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Wait for a NEWLY-created P2P group interface to appear after
+/// `p2p_group_add`. `pre_existing` is the snapshot taken before the call; we
+/// return the first `p2p-*` interface NOT in that set. This avoids latching onto
+/// a stale group netdev left over from a prior run (which may sit on the wrong
+/// radio, e.g. a leftover `p2p-wlo1-*` while we created ours on `wlx`).
+fn wait_for_group_interface(timeout: Duration, pre_existing: &[String]) -> Option<String> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(out) = Command::new("ip").args(["link", "show"]).output() {
             if out.status.success() {
-                if let Some(iface) = parse_group_interface(&String::from_utf8_lossy(&out.stdout)) {
-                    return Some(iface);
+                let current = list_group_interfaces(&String::from_utf8_lossy(&out.stdout));
+                if let Some(new) = current.iter().find(|i| !pre_existing.contains(i)) {
+                    return Some(new.clone());
                 }
             }
         }
@@ -369,20 +413,10 @@ fn wait_for_group_interface(timeout: Duration) -> Option<String> {
 }
 
 /// Extract the first `p2p-*` interface name from `ip link show` output.
+/// Used by the D-Bus backend's group-interface poll.
+#[cfg(feature = "dbus-backend")]
 pub(crate) fn parse_group_interface(output: &str) -> Option<String> {
-    for line in output.lines() {
-        if line.contains(": p2p-") {
-            let parts: Vec<&str> = line.split(": ").collect();
-            if parts.len() >= 2 {
-                let iface = parts[1].split('@').next().unwrap_or(parts[1]);
-                let iface = iface.trim_end_matches(':').trim();
-                if !iface.is_empty() {
-                    return Some(iface.to_string());
-                }
-            }
-        }
-    }
-    None
+    list_group_interfaces(output).into_iter().next()
 }
 
 fn drain_banner<R: BufRead>(reader: &mut R) {
@@ -431,23 +465,33 @@ mod tests {
     }
 
     #[test]
-    fn parses_iface_name_not_the_whole_ip_link_line() {
+    fn lists_iface_name_not_the_whole_ip_link_line() {
         let out = "1: lo: <LOOPBACK,UP> mtu 65536\n\
                    3: p2p-0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN";
-        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-0"));
+        assert_eq!(list_group_interfaces(out), vec!["p2p-0".to_string()]);
     }
 
     #[test]
-    fn parses_iface_name_with_parent_suffix() {
+    fn lists_iface_name_with_parent_suffix() {
         let out = "5: p2p-wlan0-0@wlan0: <BROADCAST,MULTICAST> mtu 1500";
-        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-wlan0-0"));
+        assert_eq!(list_group_interfaces(out), vec!["p2p-wlan0-0".to_string()]);
     }
 
     #[test]
-    fn no_p2p_interface_returns_none() {
-        assert_eq!(
-            parse_group_interface("1: lo: <LOOPBACK,UP>\n2: wlan0: <UP>"),
-            None
-        );
+    fn no_p2p_interface_returns_empty() {
+        assert!(list_group_interfaces("1: lo: <LOOPBACK,UP>\n2: wlan0: <UP>").is_empty());
+    }
+
+    #[test]
+    fn new_group_detected_by_diff_ignoring_stale() {
+        // Two p2p-* exist; one (p2p-wlo1-8) is a stale leftover present BEFORE
+        // group_add. The newly-created one is p2p-wlx...-0. The diff must pick
+        // the new one, not the first-listed stale one.
+        let before = ["p2p-wlo1-8".to_string()];
+        let after = "3: p2p-wlo1-8: <UP> mtu 1500\n\
+                     7: p2p-wlx3c78950c6ede-0: <UP> mtu 1500";
+        let current = list_group_interfaces(after);
+        let new: Vec<_> = current.iter().filter(|i| !before.contains(i)).collect();
+        assert_eq!(new, vec![&"p2p-wlx3c78950c6ede-0".to_string()]);
     }
 }
