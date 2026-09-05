@@ -201,6 +201,64 @@ path:
   live P2P handshake + IP/lease exchange has only run on the subprocess/wpa_cli
   path.
 
+## Automatic configuration negotiation (portability)
+
+The port does not hardcode a channel/adapter/resolution for one machine. At
+launch `capabilities::detect()` probes the host and builds an ordered
+**GO candidate ladder**; the backend walks it, verifies each rung, and falls
+back — so the same binary self-configures on any Ubuntu machine. This is a
+deliberate improvement over the Python original (which advertised a fixed WFD
+format with `native_index=0` = 640×480, causing sources to stream upscaled SD).
+
+- **GO bring-up ladder (Phase 1, `cli.rs`).** Candidates:
+  2.4 GHz social ch1 → ch6 → ch11 → driver-chosen (720p each); a clean 5 GHz
+  channel is prepended only when `MIRACAST_GO_5GHZ=1`. For each rung: snapshot
+  existing `p2p-*` netdevs → `p2p_group_add freq=…` → wait for a *new* group
+  iface → **verify the operating band** via `wpa_cli … status` (a P2P-GO exposes
+  its channel only there, not via `iw dev info`). First working rung wins; its
+  band-appropriate resolution is recorded in a shared cell the receiver reads at
+  the M3 capability response.
+- **WFD resolution per band (`rtsp.rs`).** `WfdVideoFormat::for_max_resolution`
+  emits native-mode + CEA bitmap for 1080p (native `0x38`, bitmap incl. 1080p60)
+  or 720p (native `0x28`, bitmap capped ≤720p). The M3 `wfd_video_formats` line
+  is built from the winning rung's resolution — a deviation from the Python
+  fixed string, documented here.
+- **Discovery watchdog (Phase 2, `ui/app.rs`).** After 60 s advertising with no
+  source (`AP-STA-CONNECTED`), `rotate_discovery_channel()` advances across the
+  social rungs and re-advertises; when 1/6/11 are exhausted it shows an in-app
+  prompt with the concrete user action and stops rotating. 5 GHz-only autonomous
+  GOs are avoided because phones scan the 2.4 GHz social channels for a sink
+  (confirmed in the field: GO on ch149 → phone never discovered it).
+- **Adapter selection (`ui/app.rs`).** Enumerate Wi-Fi ifaces from sysfs
+  (`/sys/class/net/*/phy80211`, state-independent — an idle NM-*unmanaged* USB
+  dongle is invisible to `wpa_supplicant`/`nmcli` precisely because it is free),
+  skip the active uplink (`wpa_state=COMPLETED`), prefer an idle adapter for a
+  dedicated supplicant; single-radio hosts fall back to the system supplicant.
+  Selection keys on the interface **name**, never a phy index (phy0/phy1 are not
+  stable across reboots).
+
+## Audio under sudo (PulseAudio routing)
+
+`pulsesink` connects to a per-user PulseAudio session; root (via `sudo`) has
+none, so a naïve run fails PLAYING with `Connection refused` and the pipeline
+would otherwise be video-only. `receiver::make_audio_sink` detects the sudo case
+(`SUDO_USER` set), resolves that user's uid from `/etc/passwd` (dependency-free
+`uid_of_user`), and points `pulsesink server=/run/user/<uid>/pulse/native` with
+`PULSE_COOKIE=/run/user/<uid>/pulse/cookie` for the cross-uid connection. The
+up-front `audio_sink_available` probe applies the *same* routing so its verdict
+matches the real sink. Non-root runs leave `server` unset (native session). The
+two-axis decode×audio retry loop (see below) remains the safety net: an audio
+PLAYING failure drops the audio branch so video always plays.
+
+The video PLAYING path is a retry loop over two axes — decode (HW `vaapidecodebin`
+→ SW `avdec_h264`) × audio (with → video-only) — because a failed PLAYING is a
+*synchronous* `StateChangeError` the bus watch never sees, a live
+`udpsrc`+`tsdemux` pipeline returns `StateChangeSuccess::Async` (wait on
+`state()` for the real verdict), and the shared audio branch can take the whole
+pipeline (including video) down. Live low-latency tuning: sink `sync=false`,
+`QUEUE_MAX_TIME` 200 ms, and a live-tuned `rtpjitterbuffer`
+(`latency=80`, `drop-on-latency`, `do-lost`).
+
 ## CI / release
 
 - `.github/workflows/ci.yml` — matrix of `--no-default-features` (headless core)

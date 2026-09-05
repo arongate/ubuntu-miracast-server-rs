@@ -112,6 +112,38 @@ The application will:
 2. Display a WPS PIN — enter it on your source device to connect
 3. Once connected, negotiate the stream and display the received video
 
+### How it configures itself (automatic, per-machine)
+
+You do not hand-tune the radio for your hardware — the app detects the machine's
+capabilities at launch and self-negotiates the best working configuration,
+falling back and retrying until something works:
+
+- **Adapter selection.** Wi-Fi adapters are enumerated from sysfs
+  (`/sys/class/net/*/phy80211`), which sees adapters regardless of up/down or
+  NetworkManager state. If a *second, idle* adapter exists (e.g. a USB dongle),
+  the app starts a dedicated `wpa_supplicant` on it so your primary adapter
+  stays on Wi-Fi. On a single-radio laptop it falls back to the system
+  supplicant on the connected interface (Intel iwlwifi and similar can run
+  STA + P2P-GO concurrently).
+- **GO channel ladder (bring-up).** The Group Owner is brought up by trying an
+  ordered ladder — **2.4 GHz social channel 1 → 6 → 11 → driver-chosen** — and
+  *verifying* each rung actually came up on the expected band (via
+  `wpa_cli … status`). The first rung that works is used. 2.4 GHz social
+  channels are chosen because that is where phones scan for a Miracast sink.
+  (A clean 5 GHz channel can be forced with `MIRACAST_GO_5GHZ=1` for more
+  bandwidth, but a 5 GHz-only autonomous GO is often not discoverable — opt-in.)
+- **Resolution per band.** The advertised max resolution follows the band the GO
+  came up on: 720p on 2.4 GHz (fits the link, smooth), 1080p on 5 GHz.
+- **Discovery rotation.** If no source connects within 60 s, the app rotates to
+  the next social channel and re-advertises automatically. Only after all of
+  1/6/11 have been tried does it show an in-app prompt telling you what to do
+  (open Smart View / Cast, toggle the phone's Wi-Fi and rescan).
+- **Video pipeline.** Hardware H.264 decode (VA-API) is tried first with an
+  automatic fall-back to software (`avdec_h264`); live low-latency tuning
+  (sink `sync=false`, small queues, a tuned RTP jitter buffer) keeps latency
+  down. If the audio sink cannot open, the pipeline degrades to video-only
+  rather than failing.
+
 ### CLI Options
 
 ```
@@ -160,6 +192,53 @@ Key options:
 | service | idle_timeout | 0 | Exit service after N seconds idle (0=disabled) |
 
 See [docs/configuration.md](docs/configuration.md) for the full reference.
+
+## Permissions & audio (running with vs without root)
+
+The **default build** drives `wpa_supplicant`/`wpa_cli`, a dedicated
+supplicant, `ip`, and `dnsmasq`, which need root — so it is normally launched
+with `sudo`:
+
+```bash
+sudo ubuntu-miracast-server
+```
+
+### Audio under sudo
+
+`pulsesink` connects to a per-*user* PulseAudio session, and root has none — so a
+naïve run under `sudo` plays **video but no audio** (`pulsesink: Connection
+refused`). The app handles this automatically: when launched via `sudo`
+(`SUDO_USER` is set) it routes the audio sink to the *invoking user's*
+PulseAudio — it resolves that user's uid from `/etc/passwd` and points
+`pulsesink server=/run/user/<uid>/pulse/native` (plus `PULSE_COOKIE` for the
+cross-uid connection). No configuration needed; you get sound under `sudo`.
+If the cross-uid connection is still refused (some locked-down setups), the
+pipeline degrades to video-only and logs the reason — run non-root for reliable
+audio.
+
+### Running without sudo (root-free)
+
+To run as your normal user (no `sudo`, native audio), grant the binary the two
+capabilities it needs and put your user in the `netdev` group so it can reach
+the `wpa_supplicant` control socket:
+
+```bash
+# Capabilities (netlink IP config + binding the DHCP port). NOTE: setcap is
+# cleared by every rebuild — re-apply after each `cargo build`.
+sudo setcap 'cap_net_admin,cap_net_bind_service+ep' ./target/release/ubuntu-miracast-server
+
+# One-time: join netdev (log out/in for it to take effect)
+sudo usermod -aG netdev "$USER"
+
+# Then run as yourself — PulseAudio works natively, no sudo:
+./target/release/ubuntu-miracast-server
+```
+
+The Debian package's `postinst` applies the `setcap` grant on install. The
+experimental fully root-free path (`--features dbus-backend,native-net`, env
+`MIRACAST_BACKEND=dbus MIRACAST_NET=native`) replaces `wpa_cli`/`dnsmasq` with
+the `wpa_supplicant` D-Bus API + in-process DHCP; see PORT_NOTES for its
+hardware limitations.
 
 ## Documentation
 
