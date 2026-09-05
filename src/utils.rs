@@ -225,20 +225,11 @@ pub fn list_p2p_interfaces() -> Vec<InterfaceInfo> {
 }
 
 fn get_interface_info(iface_name: &str, parent: &str) -> InterfaceInfo {
-    let mut driver = String::new();
-    if let Ok(out) = run_with_timeout(
-        Command::new("ethtool").arg("-i").arg(parent),
-        Duration::from_secs(3),
-    ) {
-        if out.status.success() {
-            for l in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some(rest) = l.strip_prefix("driver:") {
-                    driver = rest.trim().to_string();
-                    break;
-                }
-            }
-        }
-    }
+    // Driver name from sysfs instead of spawning `ethtool -i`: the
+    // /sys/class/net/<iface>/device/driver symlink points at the driver module,
+    // and its basename is exactly what `ethtool -i` reports as "driver:".
+    // Read-only, unprivileged, no subprocess.
+    let driver = read_interface_driver(parent);
 
     let mut status = "available".to_string();
     if let Ok(out) = run_with_timeout(
@@ -264,6 +255,20 @@ fn get_interface_info(iface_name: &str, parent: &str) -> InterfaceInfo {
         driver,
         status,
     }
+}
+
+/// Read a network interface's driver name from sysfs.
+///
+/// `/sys/class/net/<iface>/device/driver` is a symlink to the driver module
+/// directory; its final component is the driver name (e.g. `rtw89_8852cu`,
+/// `iwlwifi`) — the same value `ethtool -i <iface>` prints as "driver:".
+/// Returns an empty string if the interface has no bound driver.
+fn read_interface_driver(iface: &str) -> String {
+    let link = format!("/sys/class/net/{iface}/device/driver");
+    std::fs::read_link(&link)
+        .ok()
+        .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
 }
 
 /// Find the best P2P-capable interface for Miracast.
@@ -467,6 +472,16 @@ mod tests {
         assert!(validate_wpa_param("00:11:22:33:44:55").is_ok());
         assert!(validate_wpa_param("wfd_subelem_set").is_ok());
         assert!(validate_wpa_param("Ubuntu Miracast Server").is_ok());
+    }
+
+    #[test]
+    fn interface_driver_read_is_graceful() {
+        // A nonexistent interface has no sysfs driver symlink → empty string,
+        // never a panic. (The positive path depends on host hardware, so we
+        // only assert the graceful-miss behaviour deterministically.)
+        assert_eq!(read_interface_driver("definitely-no-such-iface-xyz"), "");
+        // `lo` exists but has no bound driver → also empty, still no panic.
+        let _ = read_interface_driver("lo");
     }
 
     #[test]

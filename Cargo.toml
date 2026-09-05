@@ -42,6 +42,9 @@ rand = "0.8"
 dirs = "5.0"
 # regex for MAC / event-line patterns
 regex = "1.10"
+# D-Bus for systemd --user service control. Uses the blocking API (zbus::blocking),
+# which ships by default alongside the async-io backend — no async runtime needed.
+zbus = "4"
 
 # GUI stack (feature = "gui")
 gtk4 = { version = "0.9", optional = true, features = ["v4_10"] }

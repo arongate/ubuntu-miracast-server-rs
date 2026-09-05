@@ -13,7 +13,6 @@ use crate::history::ServerSessionHistory;
 use crate::receiver::MiracastReceiver;
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -158,23 +157,76 @@ impl ServerServiceManager {
     }
 }
 
+/// Query systemd (user session bus) for a status string equivalent to
+/// `systemctl --user is-enabled|is-active <unit>`. Returns None on any D-Bus
+/// error (callers treat that as "not enabled"/"not active", matching the prior
+/// subprocess behaviour where a non-zero exit meant the same).
 fn systemctl_stdout(args: &[&str]) -> Option<String> {
-    Command::new("systemctl")
-        .args(args)
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    // args are ["--user", "is-enabled"|"is-active", <unit>].
+    let verb = args.get(1).copied()?;
+    let unit = args.get(2).copied()?;
+    let mgr = systemd_manager().ok()?;
+    match verb {
+        "is-enabled" => mgr
+            .call_method("GetUnitFileState", &(unit))
+            .ok()
+            .and_then(|m| m.body().deserialize::<String>().ok()),
+        "is-active" => {
+            // GetUnit returns the unit object path; read its ActiveState.
+            let path: zbus::zvariant::OwnedObjectPath = mgr
+                .call_method("GetUnit", &(unit))
+                .ok()?
+                .body()
+                .deserialize()
+                .ok()?;
+            let unit_proxy = zbus::blocking::Proxy::new(
+                mgr.connection(),
+                "org.freedesktop.systemd1",
+                path.as_str(),
+                "org.freedesktop.systemd1.Unit",
+            )
+            .ok()?;
+            unit_proxy.get_property::<String>("ActiveState").ok()
+        }
+        _ => None,
+    }
 }
 
-fn systemctl_ok(args: &[&str], verb: &str) -> Result<(), ServiceError> {
-    match Command::new("systemctl").args(args).output() {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(ServiceError(format!(
-            "systemctl {verb} failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ))),
-        Err(e) => Err(ServiceError(format!("Failed to {verb} service: {e}"))),
-    }
+/// Perform a systemd (user session bus) action equivalent to
+/// `systemctl --user enable|disable|start|stop|daemon-reload <unit>`.
+fn systemctl_ok(args: &[&str], verb_label: &str) -> Result<(), ServiceError> {
+    let verb = args.get(1).copied().unwrap_or("");
+    let unit = args.get(2).copied().unwrap_or(SERVICE_NAME);
+    let mgr = systemd_manager()
+        .map_err(|e| ServiceError(format!("Failed to {verb_label} service: {e}")))?;
+
+    let result = match verb {
+        // EnableUnitFiles(files: as, runtime: b, force: b) -> (carries_install_info: b, changes)
+        "enable" => mgr.call_method("EnableUnitFiles", &(vec![unit], false, true)),
+        // DisableUnitFiles(files: as, runtime: b) -> changes
+        "disable" => mgr.call_method("DisableUnitFiles", &(vec![unit], false)),
+        // StartUnit(name: s, mode: s) -> job: o
+        "start" => mgr.call_method("StartUnit", &(unit, "replace")),
+        "stop" => mgr.call_method("StopUnit", &(unit, "replace")),
+        "daemon-reload" => mgr.call_method("Reload", &()),
+        other => {
+            return Err(ServiceError(format!("unknown systemd verb: {other}")));
+        }
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| ServiceError(format!("systemctl {verb_label} failed: {e}")))
+}
+
+/// Connect to the user session bus and return a proxy to the systemd Manager.
+fn systemd_manager() -> Result<zbus::blocking::Proxy<'static>, zbus::Error> {
+    let conn = zbus::blocking::Connection::session()?;
+    zbus::blocking::Proxy::new(
+        &conn,
+        "org.freedesktop.systemd1",
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+    )
 }
 
 /// Run the Miracast Server in headless service mode.
@@ -365,5 +417,21 @@ mod tests {
     #[test]
     fn service_name_matches() {
         assert_eq!(SERVICE_NAME, "ubuntu-miracast-server.service");
+    }
+
+    #[test]
+    fn dbus_manager_queries_do_not_panic() {
+        // Only meaningful where a user session bus exists (dev boxes, CI with a
+        // dbus session). Where it does not, systemd_manager() errors and the
+        // status helpers return false — assert they degrade gracefully rather
+        // than panic, matching the prior subprocess behaviour.
+        if systemd_manager().is_err() {
+            eprintln!("no session bus; skipping live D-Bus assertions");
+            return;
+        }
+        let mgr = ServerServiceManager::new();
+        // A not-installed unit must report not-enabled / not-active, never panic.
+        let _ = mgr.is_enabled();
+        let _ = mgr.is_running();
     }
 }
