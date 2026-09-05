@@ -38,6 +38,11 @@ struct App {
     auto_accept: bool,
     connection_timeout: i32,
     shutting_down: Rc<RefCell<bool>>,
+    /// Phase-2 discovery watchdog: when advertising began (None = not
+    /// advertising / already connected once), and whether a source has connected
+    /// this advertising cycle.
+    advertising_since: Rc<RefCell<Option<std::time::Instant>>>,
+    source_connected: Rc<RefCell<bool>>,
 }
 
 /// Entry point invoked by `main.rs` for the GUI build.
@@ -191,6 +196,8 @@ fn activate(
         auto_accept,
         connection_timeout,
         shutting_down: Rc::new(RefCell::new(false)),
+        advertising_since: Rc::new(RefCell::new(None)),
+        source_connected: Rc::new(RefCell::new(false)),
     });
 
     install_view_hooks(&state);
@@ -233,8 +240,60 @@ fn start_event_drain(state: Rc<App>, rx: EventReceiver) {
         while let Ok(event) = rx.try_recv() {
             handle_event(&state, event);
         }
+        check_discovery_watchdog(&state);
         glib::ControlFlow::Continue
     });
+}
+
+/// Phase-2 discovery watchdog: if we have been advertising for >60s with no
+/// source connected, rotate to the next 2.4GHz social channel and re-advertise.
+/// When the social channels are exhausted, prompt the user (in-app status) with
+/// the concrete action and stop rotating.
+const NO_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn check_discovery_watchdog(state: &Rc<App>) {
+    if *state.shutting_down.borrow() || *state.source_connected.borrow() {
+        return;
+    }
+    let elapsed = match *state.advertising_since.borrow() {
+        Some(since) => since.elapsed(),
+        None => return,
+    };
+    if elapsed < NO_CONNECT_TIMEOUT {
+        return;
+    }
+    // Timed out with no connection. Rotate the discovery channel.
+    let backend = state.advertiser.borrow().backend();
+    match backend.rotate_discovery_channel() {
+        Some(label) => {
+            log::info!("No source connected in 60s — rotating discovery to {label}");
+            state
+                .window
+                .set_status(&format!("No connection — retrying on {label}…"));
+            // Re-advertise on the rotated channel: stop then start re-runs the
+            // GO bring-up ladder (now rotated) via the advertiser.
+            {
+                let mut adv = state.advertiser.borrow_mut();
+                adv.stop_advertising();
+                adv.start_advertising();
+            }
+            // Reset the watchdog window for the new channel.
+            *state.advertising_since.borrow_mut() = Some(std::time::Instant::now());
+        }
+        None => {
+            // Ladder exhausted — prompt the user and stop rotating.
+            log::warn!(
+                "No source connected after trying all 2.4GHz social channels — prompting user"
+            );
+            state.window.set_status(
+                "No source connected. On your phone: open Smart View / Cast and select \
+                 'Ubuntu Miracast Server'. If it is not listed, toggle the phone's Wi-Fi \
+                 off/on and rescan. (The sink is advertising on 2.4GHz ch 1/6/11.)",
+            );
+            // Disarm so we don't spam; the user can restart advertising to retry.
+            *state.advertising_since.borrow_mut() = None;
+        }
+    }
 }
 
 fn handle_event(state: &Rc<App>, event: Event) {
@@ -243,6 +302,9 @@ fn handle_event(state: &Rc<App>, event: Event) {
         Event::AdvertisingStarted { group_interface } => {
             win.set_status(&format!("Advertising as '{}'", state.device_name));
             win.display().set_state_idle(&state.device_name);
+            // Arm the Phase-2 no-connect watchdog for this advertising cycle.
+            *state.advertising_since.borrow_mut() = Some(std::time::Instant::now());
+            *state.source_connected.borrow_mut() = false;
             on_advertiser_started(state, &group_interface);
         }
         Event::AdvertisingStopped => win.set_status("Advertising stopped"),
@@ -254,6 +316,9 @@ fn handle_event(state: &Rc<App>, event: Event) {
             win.set_status(&format!("Connected: {}", conn.peer_name));
             win.display().hide_pin();
             win.display().set_state_connected(&conn.peer_name);
+            // A source connected — disarm the no-connect watchdog.
+            *state.source_connected.borrow_mut() = true;
+            *state.advertising_since.borrow_mut() = None;
             if state.receiver.borrow().is_receiving() {
                 log::warn!("Ignoring new connection — already receiving");
             } else {

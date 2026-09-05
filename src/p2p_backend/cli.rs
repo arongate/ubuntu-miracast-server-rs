@@ -60,6 +60,9 @@ pub struct WpaCliBackend {
     /// Shared cell the receiver reads for its advertised resolution; set to the
     /// winning candidate's resolution once a GO comes up.
     won_resolution: std::sync::Arc<std::sync::Mutex<(u32, u32)>>,
+    /// Phase-2 discovery rotation: how many social rungs to skip at the front of
+    /// the ladder on the NEXT bring-up (advanced by rotate_discovery_channel).
+    rotation_offset: std::sync::atomic::AtomicUsize,
 }
 
 impl WpaCliBackend {
@@ -69,6 +72,7 @@ impl WpaCliBackend {
             p2p_interface: std::sync::Mutex::new(None),
             go_candidates: Vec::new(),
             won_resolution: std::sync::Arc::new(std::sync::Mutex::new((1280, 720))),
+            rotation_offset: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -177,6 +181,17 @@ impl P2pBackend for WpaCliBackend {
             ]
         } else {
             self.go_candidates.clone()
+        };
+        // Phase-2 rotation: rotate the ladder left by the current offset so a
+        // no-connect rotation starts bring-up on the next social channel.
+        let candidates = {
+            let off = self
+                .rotation_offset
+                .load(std::sync::atomic::Ordering::SeqCst)
+                % candidates.len().max(1);
+            let mut v = candidates;
+            v.rotate_left(off);
+            v
         };
 
         let mut group_iface: Option<String> = None;
@@ -448,6 +463,28 @@ impl P2pBackend for WpaCliBackend {
         let _ = proc.kill();
         let _ = proc.wait();
         log::info!("Event monitor thread exiting");
+    }
+
+    fn rotate_discovery_channel(&self) -> Option<String> {
+        // Rotate only across the 2.4GHz SOCIAL rungs (the discoverable ones);
+        // rotating onto driver-chosen/5GHz would not help discovery. The budget
+        // is the count of social rungs minus the one already tried.
+        let social: Vec<&crate::capabilities::GoCandidate> = self
+            .go_candidates
+            .iter()
+            .filter(|c| c.band == crate::capabilities::GoBand::Band24 && c.freq_mhz != 0)
+            .collect();
+        let social_count = social.len().max(1);
+        let next = self
+            .rotation_offset
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if next >= social_count {
+            // Exhausted the social channels — signal the caller to prompt.
+            return None;
+        }
+        // The rung that will lead the ladder on the next bring-up.
+        social.get(next).map(|c| c.label.to_string())
     }
 }
 

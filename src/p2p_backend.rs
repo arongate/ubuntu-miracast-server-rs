@@ -102,6 +102,15 @@ pub trait P2pBackend: Send + Sync {
         tx: Sender<P2pEvent>,
         running: &std::sync::atomic::AtomicBool,
     );
+
+    /// Phase 2 discovery fallback: advance the GO candidate ladder to the next
+    /// discovery-affecting rung (next 2.4GHz social channel) for the NEXT
+    /// `start_group_owner` call. Returns the human label of the rung now
+    /// selected, or `None` if the ladder is exhausted (caller should prompt the
+    /// user). Default: no rotation available.
+    fn rotate_discovery_channel(&self) -> Option<String> {
+        None
+    }
 }
 
 pub mod cli;
