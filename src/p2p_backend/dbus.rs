@@ -50,7 +50,7 @@ const IFACE_PEER: &str = "fi.w1.wpa_supplicant1.Peer";
 const WFD_ASSOCIATED_BSSID_SUBELEMENT_HEX: &str = "0006000000000000";
 const WFD_COUPLED_SINK_SUBELEMENT_HEX: &str = "000700000000000000";
 
-const WPS_REARM_INTERVAL: Duration = Duration::from_secs(90);
+const WPS_REARM_INTERVAL: Duration = Duration::from_secs(240);
 const GROUP_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 /// Short blocking read used by the monitor loop so `running` can be re-checked.
 const SIGNAL_POLL_TIMEOUT: Duration = Duration::from_secs(1);

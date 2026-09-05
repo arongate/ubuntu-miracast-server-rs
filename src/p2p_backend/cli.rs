@@ -21,7 +21,14 @@ use crate::utils::{find_p2p_interface, run_wpa_cli, WpaError};
 const WFD_ASSOCIATED_BSSID_SUBELEMENT: &str = "0006000000000000";
 const WFD_COUPLED_SINK_SUBELEMENT: &str = "000700000000000000";
 
-const WPS_REARM_INTERVAL: Duration = Duration::from_secs(90);
+const WPS_REARM_INTERVAL: Duration = Duration::from_secs(240);
+
+/// WPS PIN validity window passed to `wps_pin any <pin> <timeout>`. The
+/// wpa_supplicant default is 120s, too short to comfortably read an 8-digit PIN
+/// and type it on a phone. 300s gives a generous window; the rearm interval
+/// (240s) sits just inside it so the SAME PIN is continuously re-armed and never
+/// lapses between rearms.
+const WPS_PIN_TIMEOUT_SECS: &str = "300";
 
 /// Encode WFD Device Information sub-element for a Primary Sink.
 /// Byte-exact: `0006` + DevInfo(0011) + rtsp_port(hex) + throughput(012C).
@@ -221,11 +228,13 @@ impl P2pBackend for WpaCliBackend {
 
     fn arm_wps_pin(&self, group_interface: &str, pin: &str) -> BackendResult<()> {
         // Retry up to 10× with 1s delays — the group control socket may not be
-        // ready immediately after p2p_group_add.
+        // ready immediately after p2p_group_add. Arm with an explicit 300s
+        // timeout (WPS default is only 120s) so the user has ample time to read
+        // the PIN and type it on the phone before it expires.
         for attempt in 0..10 {
             match run_wpa_cli(
                 group_interface,
-                &["wps_pin", "any", pin],
+                &["wps_pin", "any", pin, WPS_PIN_TIMEOUT_SECS],
                 false,
                 self.ctrl_path.as_deref(),
             ) {
