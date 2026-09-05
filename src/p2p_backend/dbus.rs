@@ -156,6 +156,23 @@ impl P2pBackend for DbusBackend {
         let (iface, dev_obj) = self.ensure_device_obj()?;
         log::info!("Setting up P2P GO on {iface}");
 
+        // (a0) Enable global WFD advertisement. This is the ONE thing the D-Bus
+        //      interface cannot do on wpa_supplicant 2.10: `WFDIEs` is writable
+        //      but INERT unless the global `wifi_display` flag is set, and there
+        //      is no D-Bus property/method for it (verified live — the root
+        //      object exposes only WFDIEs). So issue the single `wpa_cli set
+        //      wifi_display 1` here; everything else stays on D-Bus. Without
+        //      this the WFD IEs never reach the beacon and no phone discovers
+        //      the sink. (netdev-group control socket → no sudo where the socket
+        //      is group-accessible; otherwise this one call needs privilege.)
+        if let Err(e) =
+            crate::utils::run_wpa_cli(&iface, &["set", "wifi_display", "1"], false, None)
+        {
+            log::warn!(
+                "Could not enable wifi_display via wpa_cli ({e}); WFD IEs may not advertise"
+            );
+        }
+
         // (a) WFDIEs on the ROOT object — hex-decode of the exact CLI payload:
         //     0006 0011 <rtsp_port BE> 012C  ++ associated-BSSID ++ coupled-sink.
         let wfd_ies = build_wfd_ies(rtsp_port)?;
