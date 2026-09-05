@@ -267,8 +267,15 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
     );
 
     let (tx, rx) = channel();
-    let mut advertiser =
-        MiracastAdvertiser::new(name.clone(), rtsp_port, iface.clone(), None, tx.clone());
+    // Service mode uses the system wpa_supplicant (no dedicated ctrl path).
+    let backend = crate::p2p_backend::select_backend(None);
+    let mut advertiser = MiracastAdvertiser::new(
+        name.clone(),
+        rtsp_port,
+        iface.clone(),
+        std::sync::Arc::clone(&backend),
+        tx.clone(),
+    );
     let mut receiver = MiracastReceiver::new(rtsp_port, rtp_port, true, audio_enabled, tx.clone());
     let mut handler: Option<ConnectionHandler> = None;
 
@@ -304,6 +311,7 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
                                 go_intent,
                                 auto_accept,
                                 connection_timeout,
+                                std::sync::Arc::clone(&backend),
                                 tx.clone(),
                             );
                             h.start_listening(group_interface);

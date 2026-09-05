@@ -1,0 +1,424 @@
+//! `wpa_cli` (subprocess) implementation of [`P2pBackend`].
+//!
+//! This is the DEFAULT backend and is a faithful relocation of the logic that
+//! previously lived inline in `advertiser.rs` / `connection.rs` — identical
+//! argv, identical WFD subelement hex, identical ATTACH event loop. It is the
+//! hardware-validated path; the D-Bus backend is opt-in.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
+
+use regex::Regex;
+
+use super::{BackendResult, P2pBackend, P2pEvent};
+use crate::utils::{find_p2p_interface, run_wpa_cli, WpaError};
+
+// WFD Device Info: Primary Sink (01) + Session Available (10) = 0x0011
+// (matching lazycast's proven working value — no WSD bit).
+const WFD_ASSOCIATED_BSSID_SUBELEMENT: &str = "0006000000000000";
+const WFD_COUPLED_SINK_SUBELEMENT: &str = "000700000000000000";
+
+const WPS_REARM_INTERVAL: Duration = Duration::from_secs(90);
+
+/// Encode WFD Device Information sub-element for a Primary Sink.
+/// Byte-exact: `0006` + DevInfo(0011) + rtsp_port(hex) + throughput(012C).
+pub(crate) fn encode_wfd_device_info(rtsp_port: u16) -> String {
+    let device_info: u16 = 0x0011;
+    let throughput: u16 = 0x012C;
+    format!("0006{device_info:04X}{rtsp_port:04X}{throughput:04X}")
+}
+
+fn ap_sta_connected_re() -> &'static Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"AP-STA-CONNECTED\s+([0-9a-fA-F:]{17})").unwrap())
+}
+fn ap_sta_disconnected_re() -> &'static Regex {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"AP-STA-DISCONNECTED\s+([0-9a-fA-F:]{17})").unwrap())
+}
+
+/// The subprocess backend. Holds an optional dedicated-supplicant control path
+/// and the resolved P2P device interface.
+pub struct WpaCliBackend {
+    ctrl_path: Option<String>,
+    /// Resolved P2P device interface (set on first `ensure_interface`).
+    p2p_interface: std::sync::Mutex<Option<String>>,
+}
+
+impl WpaCliBackend {
+    pub fn new(ctrl_path: Option<String>) -> Self {
+        Self {
+            ctrl_path,
+            p2p_interface: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Optionally seed the P2P interface (from config / CLI flag).
+    pub fn with_interface(self, iface: Option<String>) -> Self {
+        *self.p2p_interface.lock().unwrap_or_else(|e| e.into_inner()) = iface;
+        self
+    }
+
+    fn wpa(
+        &self,
+        args: &[&str],
+        interface: Option<&str>,
+        skip_last_validation: bool,
+    ) -> Result<String, WpaError> {
+        let iface = interface
+            .map(|s| s.to_string())
+            .or_else(|| self.current_iface())
+            .unwrap_or_default();
+        run_wpa_cli(
+            &iface,
+            args,
+            skip_last_validation,
+            self.ctrl_path.as_deref(),
+        )
+    }
+
+    fn current_iface(&self) -> Option<String> {
+        self.p2p_interface
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+impl P2pBackend for WpaCliBackend {
+    fn ensure_interface(&self) -> BackendResult<String> {
+        if let Some(i) = self.current_iface() {
+            return Ok(i);
+        }
+        let (p2p_iface, _) = find_p2p_interface()?;
+        *self.p2p_interface.lock().unwrap_or_else(|e| e.into_inner()) = Some(p2p_iface.clone());
+        Ok(p2p_iface)
+    }
+
+    fn start_group_owner(&self, device_name: &str, rtsp_port: u16) -> BackendResult<String> {
+        let iface = self.ensure_interface()?;
+        log::info!("Setting up P2P GO on {iface}");
+
+        // WFD + device config (identical argv + order to the Python source).
+        let dev_info = encode_wfd_device_info(rtsp_port);
+        self.wpa(&["set", "wifi_display", "1"], None, false)?;
+        self.wpa(&["wfd_subelem_set", "0", &dev_info], None, false)?;
+        self.wpa(
+            &["wfd_subelem_set", "1", WFD_ASSOCIATED_BSSID_SUBELEMENT],
+            None,
+            false,
+        )?;
+        self.wpa(
+            &["wfd_subelem_set", "6", WFD_COUPLED_SINK_SUBELEMENT],
+            None,
+            false,
+        )?;
+        self.wpa(&["set", "device_name", device_name], None, true)?;
+        self.wpa(&["set", "device_type", "7-0050F204-1"], None, false)?;
+        self.wpa(&["set", "p2p_go_ht40", "1"], None, false)?;
+        log::debug!("WFD subelements configured");
+
+        self.wpa(&["p2p_find", "type=progressive"], None, true)?;
+        log::debug!("P2P find started (advertising WFD IEs)");
+
+        let result = self.wpa(&["p2p_group_add", "persistent"], None, false)?;
+        if result.contains("FAIL") {
+            return Err(super::BackendError::Runtime(format!(
+                "p2p_group_add failed: {result}"
+            )));
+        }
+        log::info!("p2p_group_add issued, waiting for group interface...");
+
+        let group_iface = wait_for_group_interface(Duration::from_secs(10)).ok_or_else(|| {
+            super::BackendError::Runtime(
+                "P2P group interface did not appear within 10 seconds".to_string(),
+            )
+        })?;
+        log::info!("P2P GO created on interface: {group_iface}");
+
+        // Best-effort: set WFD subelements on the group interface too.
+        if let Err(e) = self.wpa(&["set", "wifi_display", "1"], Some(&group_iface), false) {
+            log::debug!("Could not set WFD on group iface (may not be needed): {e}");
+        } else if let Err(e) = self.wpa(
+            &["wfd_subelem_set", "0", &dev_info],
+            Some(&group_iface),
+            false,
+        ) {
+            log::debug!("Could not set WFD on group iface (may not be needed): {e}");
+        }
+
+        Ok(group_iface)
+    }
+
+    fn remove_group(&self, group_interface: &str) -> BackendResult<()> {
+        self.wpa(&["p2p_group_remove", group_interface], None, false)?;
+        log::info!("Removed P2P group on {group_interface}");
+        Ok(())
+    }
+
+    fn arm_wps_pin(&self, group_interface: &str, pin: &str) -> BackendResult<()> {
+        // Retry up to 10× with 1s delays — the group control socket may not be
+        // ready immediately after p2p_group_add.
+        for attempt in 0..10 {
+            match run_wpa_cli(
+                group_interface,
+                &["wps_pin", "any", pin],
+                false,
+                self.ctrl_path.as_deref(),
+            ) {
+                Ok(result) if !result.contains("FAIL") => {
+                    log::info!(
+                        "WPS PIN armed: {pin} on {group_interface} (attempt {})",
+                        attempt + 1
+                    );
+                    return Ok(());
+                }
+                Ok(_) => log::debug!("wps_pin attempt {} failed, retrying...", attempt + 1),
+                Err(e) => log::debug!("wps_pin attempt {} error: {e}", attempt + 1),
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        log::error!("Failed to arm WPS PIN after 10 attempts");
+        Err(super::BackendError::Runtime(
+            "Failed to arm WPS PIN — group interface not ready".to_string(),
+        ))
+    }
+
+    fn run_event_monitor(&self, group_interface: &str, tx: Sender<P2pEvent>, running: &AtomicBool) {
+        log::info!("Event monitor starting on group interface {group_interface}");
+
+        let mut cmd = Command::new("sudo");
+        cmd.arg("wpa_cli");
+        if let Some(p) = &self.ctrl_path {
+            cmd.arg("-p").arg(p);
+        }
+        cmd.arg("-i").arg(group_interface);
+
+        let mut proc = match cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("Failed to start wpa_cli: {e}");
+                let _ = tx.send(P2pEvent::Error(format!(
+                    "Failed to start event monitor: {e}"
+                )));
+                return;
+            }
+        };
+
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(Some(_)) = proc.try_wait() {
+            let stderr = proc
+                .stderr
+                .take()
+                .map(|mut e| {
+                    let mut s = String::new();
+                    let _ = e.read_to_string(&mut s);
+                    s
+                })
+                .unwrap_or_default();
+            log::error!("wpa_cli exited immediately: {}", stderr.trim());
+            let _ = tx.send(P2pEvent::Error(format!(
+                "wpa_cli failed: {}",
+                stderr.trim()
+            )));
+            return;
+        }
+
+        let stdout = proc.stdout.take().expect("piped stdout");
+        let mut reader = BufReader::new(stdout);
+
+        drain_banner(&mut reader);
+        if let Some(stdin) = proc.stdin.as_mut() {
+            let _ = stdin.write_all(b"ATTACH\n");
+            let _ = stdin.flush();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        drain_output(&mut reader, Duration::from_secs(1));
+
+        log::info!("Event monitor attached to {group_interface} — waiting for connections");
+
+        let mut last_rearm = Instant::now();
+        while running.load(Ordering::SeqCst) {
+            // The monitor re-arms WPS periodically; it signals that intent to
+            // the handler via WpsPinNeeded on the interval (the handler owns the
+            // PIN + arming so the backend stays stateless about PIN values).
+            if last_rearm.elapsed() >= WPS_REARM_INTERVAL {
+                let _ = tx.send(P2pEvent::WpsPinNeeded);
+                last_rearm = Instant::now();
+            }
+
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => {
+                    if let Ok(Some(_)) = proc.try_wait() {
+                        log::error!("wpa_cli process died");
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            let mut line = line.trim().to_string();
+            if line.is_empty() || line == ">" || line == "> " {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("> ") {
+                line = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix('>') {
+                line = rest.to_string();
+            }
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.contains("AP-STA")
+                || line.contains("P2P")
+                || line.contains("WPS")
+                || line.contains("CTRL")
+            {
+                log::info!("GO event: {line}");
+            }
+
+            if let Some(cap) = ap_sta_connected_re().captures(&line) {
+                let _ = tx.send(P2pEvent::PeerConnected {
+                    mac: cap[1].to_string(),
+                });
+                continue;
+            }
+            if line.contains("WPS-PIN-NEEDED") {
+                let _ = tx.send(P2pEvent::WpsPinNeeded);
+                continue;
+            }
+            if ap_sta_disconnected_re().is_match(&line) {
+                let _ = tx.send(P2pEvent::PeerDisconnected);
+                continue;
+            }
+            if line.contains("P2P-GROUP-REMOVED") {
+                log::info!("P2P group removed");
+                let _ = tx.send(P2pEvent::GroupRemoved);
+                break;
+            }
+        }
+
+        if let Some(stdin) = proc.stdin.as_mut() {
+            let _ = stdin.write_all(b"QUIT\n");
+            let _ = stdin.flush();
+        }
+        let _ = proc.kill();
+        let _ = proc.wait();
+        log::info!("Event monitor thread exiting");
+    }
+}
+
+/// Wait for the P2P group interface to appear after `p2p_group_add`.
+fn wait_for_group_interface(timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(out) = Command::new("ip").args(["link", "show"]).output() {
+            if out.status.success() {
+                if let Some(iface) = parse_group_interface(&String::from_utf8_lossy(&out.stdout)) {
+                    return Some(iface);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// Extract the first `p2p-*` interface name from `ip link show` output.
+pub(crate) fn parse_group_interface(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if line.contains(": p2p-") {
+            let parts: Vec<&str> = line.split(": ").collect();
+            if parts.len() >= 2 {
+                let iface = parts[1].split('@').next().unwrap_or(parts[1]);
+                let iface = iface.trim_end_matches(':').trim();
+                if !iface.is_empty() {
+                    return Some(iface.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn drain_banner<R: BufRead>(reader: &mut R) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let stripped = line.trim();
+                if stripped.contains("Interactive mode") || stripped == ">" {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn drain_output<R: BufRead>(reader: &mut R, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_info_subelement_hex_is_exact() {
+        assert_eq!(encode_wfd_device_info(7236), "000600111C44012C");
+        assert_eq!(encode_wfd_device_info(7237), "000600111C45012C");
+    }
+
+    #[test]
+    fn subelement_constants_match_python() {
+        assert_eq!(WFD_ASSOCIATED_BSSID_SUBELEMENT, "0006000000000000");
+        assert_eq!(WFD_COUPLED_SINK_SUBELEMENT, "000700000000000000");
+    }
+
+    #[test]
+    fn parses_iface_name_not_the_whole_ip_link_line() {
+        let out = "1: lo: <LOOPBACK,UP> mtu 65536\n\
+                   3: p2p-0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN";
+        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-0"));
+    }
+
+    #[test]
+    fn parses_iface_name_with_parent_suffix() {
+        let out = "5: p2p-wlan0-0@wlan0: <BROADCAST,MULTICAST> mtu 1500";
+        assert_eq!(parse_group_interface(out).as_deref(), Some("p2p-wlan0-0"));
+    }
+
+    #[test]
+    fn no_p2p_interface_returns_none() {
+        assert_eq!(
+            parse_group_interface("1: lo: <LOOPBACK,UP>\n2: wlan0: <UP>"),
+            None
+        );
+    }
+}

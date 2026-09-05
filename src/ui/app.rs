@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::advertiser::MiracastAdvertiser;
 use crate::config::ServerConfig;
@@ -108,13 +109,17 @@ fn activate(
 
     let (tx, rx) = channel();
 
+    // One P2P backend (wpa_cli by default; wpa_supplicant D-Bus when selected),
+    // shared by the advertiser and the connection handler.
+    let backend = crate::p2p_backend::select_backend(ctrl_path.clone());
+
     let advertiser = Rc::new(RefCell::new(MiracastAdvertiser::new(
         device_name.clone(),
         rtsp_port,
         effective_interface
             .clone()
             .or_else(|| p2p_interface.clone()),
-        ctrl_path.clone(),
+        Arc::clone(&backend),
         tx.clone(),
     )));
     let receiver = Rc::new(RefCell::new(MiracastReceiver::new(
@@ -285,14 +290,9 @@ fn on_advertiser_started(state: &Rc<App>, group_interface: &str) {
         state.go_intent,
         state.auto_accept,
         state.connection_timeout,
+        state.advertiser.borrow().backend(),
         state.event_sender.clone(),
     );
-    // Route wpa_cli through the dedicated supplicant's control socket, if any.
-    if let Some(s) = state.p2p_supplicant.borrow_mut().as_mut() {
-        if s.is_running() {
-            handler.set_ctrl_path(Some(s.ctrl_path().to_string()));
-        }
-    }
     handler.start_listening(group_interface);
     *state.connection_handler.borrow_mut() = Some(handler);
 }

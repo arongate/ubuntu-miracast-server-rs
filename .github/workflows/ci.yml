@@ -53,6 +53,9 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy ${{ matrix.features }} --all-targets --locked -- -D warnings
 
+      - name: Clippy with dbus-backend (deny warnings)
+        run: cargo clippy ${{ matrix.features }} --features dbus-backend --all-targets --locked -- -D warnings
+
       - name: Test
         run: cargo test ${{ matrix.features }} --locked
 

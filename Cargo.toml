@@ -18,6 +18,8 @@ path = "src/main.rs"
 # GUI is on by default; build the headless core with --no-default-features.
 default = ["gui"]
 gui = ["dep:gtk4", "dep:libadwaita", "dep:gstgtk4"]
+# Opt-in wpa_supplicant D-Bus P2P backend (else the wpa_cli subprocess backend).
+dbus-backend = []
 
 [dependencies]
 # GStreamer bound in-process (matches PyGObject Gst usage): dynamic pipeline,

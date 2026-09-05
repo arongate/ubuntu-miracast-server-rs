@@ -1,27 +1,26 @@
 //! Wi-Fi Direct Connection Handler for Ubuntu Miracast Server.
 //!
-//! Autonomous GO approach: monitors the GROUP interface for AP-STA-CONNECTED
-//! events after arming a WPS PIN. Faithful port of
-//! `src/miracast_server/connection.py`.
+//! Autonomous GO approach: monitors the GROUP interface for peer connect
+//! events after arming a WPS PIN. The P2P control plane (event monitoring,
+//! WPS arming) is delegated to [`P2pBackend`]; this module owns PIN generation,
+//! DHCP/IP setup, peer-IP resolution, and the app-facing event emission.
 //!
 //! Flow:
 //!   1. Receive group interface name from advertiser
-//!   2. Generate and display a WPS PIN
-//!   3. Arm the GO's WPS registrar: `wps_pin any <PIN>`
-//!   4. Wait for AP-STA-CONNECTED (source connected)
-//!   5. Set up DHCP on the group interface
-//!   6. Emit connection-received with peer details
+//!   2. Generate and display a WPS PIN, arm it via the backend
+//!   3. Backend delivers `PeerConnected` when a source joins
+//!   4. Set up DHCP on the group interface, resolve the peer IP
+//!   5. Emit connection-received with peer details
 
 use crate::events::{Event, EventSender};
 use crate::models::IncomingConnection;
+use crate::p2p_backend::{P2pBackend, P2pEvent};
 use crate::sync_ext::LockExt;
-use crate::utils::run_wpa_cli;
 use chrono::Local;
 use rand::Rng;
-use regex::Regex;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,24 +28,11 @@ use std::time::{Duration, Instant};
 const OUR_IP: &str = "192.168.173.1";
 /// Fallback peer IP if no DHCP lease is found (first of the range).
 const FALLBACK_PEER_IP: &str = "192.168.173.80";
-/// Re-arm the WPS PIN this often (registrar timeout is ~120s).
-const WPS_REARM_INTERVAL: Duration = Duration::from_secs(90);
 
 fn generate_pin() -> String {
     // 8-digit WPS PIN — non-crypto, exactly like Python random.randint.
     let n: u32 = rand::thread_rng().gen_range(10_000_000..=99_999_999);
     n.to_string()
-}
-
-fn ap_sta_connected_re() -> &'static Regex {
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"AP-STA-CONNECTED\s+([0-9a-fA-F:]{17})").unwrap())
-}
-fn ap_sta_disconnected_re() -> &'static Regex {
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"AP-STA-DISCONNECTED\s+([0-9a-fA-F:]{17})").unwrap())
 }
 
 /// Shared state accessible from the monitor thread and the owner.
@@ -55,9 +41,22 @@ struct Shared {
     active_connection: Mutex<Option<IncomingConnection>>,
     current_pin: Mutex<Option<String>>,
     group_interface: Mutex<Option<String>>,
-    ctrl_path: Mutex<Option<String>>,
     our_ip: Mutex<String>,
     events: EventSender,
+    backend: Arc<dyn P2pBackend>,
+}
+
+impl Shared {
+    /// Arm the current PIN on the group interface via the backend.
+    fn arm_current_pin(&self) {
+        let group = self.group_interface.lock_safe().clone();
+        let pin = self.current_pin.lock_safe().clone();
+        if let (Some(group), Some(pin)) = (group, pin) {
+            if let Err(e) = self.backend.arm_wps_pin(&group, &pin) {
+                let _ = self.events.send(Event::ConnectionError(e.to_string()));
+            }
+        }
+    }
 }
 
 /// Handles Wi-Fi Direct P2P connections via WPS on the Group Owner interface.
@@ -79,6 +78,7 @@ impl ConnectionHandler {
         go_intent: i32,
         auto_accept: bool,
         connection_timeout: i32,
+        backend: Arc<dyn P2pBackend>,
         events: EventSender,
     ) -> Self {
         Self {
@@ -87,9 +87,9 @@ impl ConnectionHandler {
                 active_connection: Mutex::new(None),
                 current_pin: Mutex::new(None),
                 group_interface: Mutex::new(None),
-                ctrl_path: Mutex::new(None),
                 our_ip: Mutex::new(OUR_IP.to_string()),
                 events,
+                backend,
             }),
             thread: None,
             go_intent,
@@ -107,16 +107,12 @@ impl ConnectionHandler {
         self.shared.active_connection.lock_safe().clone()
     }
 
-    pub fn set_ctrl_path(&self, ctrl_path: Option<String>) {
-        *self.shared.ctrl_path.lock_safe() = ctrl_path;
-    }
-
     pub fn set_p2p_interface(&mut self, iface: impl Into<String>) {
         self.p2p_interface = iface.into();
     }
 
-    /// Start listening on the P2P group interface: sets up IP/DHCP immediately,
-    /// arms WPS PIN, and monitors for events.
+    /// Start listening on the P2P group interface: sets up IP/DHCP, arms WPS
+    /// PIN, and consumes backend P2P events.
     pub fn start_listening(&mut self, group_interface: impl Into<String>) {
         if self.shared.running.load(Ordering::SeqCst) {
             log::debug!("Already listening — ignoring");
@@ -126,18 +122,16 @@ impl ConnectionHandler {
         *self.shared.group_interface.lock_safe() = Some(group_interface.clone());
         self.shared.running.store(true, Ordering::SeqCst);
 
-        // NOTE: DHCP setup and the initial WPS-PIN arm each block for seconds
-        // (dnsmasq spawn + up to 10×1s wps_pin retries). The Python armed these
-        // synchronously, but our caller is the GTK main loop's event drain, so
-        // doing that here freezes the UI ("not responding"). Move ALL blocking
-        // setup into the monitor thread; start_listening returns immediately.
+        // NOTE: DHCP setup + WPS arm block for seconds. The caller is the GTK
+        // main loop's event drain, so we do ALL of it on the worker thread and
+        // return immediately (avoids the "not responding" freeze).
         let shared = Arc::clone(&self.shared);
         let group = group_interface.clone();
         self.thread = Some(
             std::thread::Builder::new()
                 .name("go-event-monitor".to_string())
                 .spawn(move || {
-                    // Set up IP + DHCP FIRST (before any client tries to connect).
+                    // IP + DHCP first (before any client tries to connect).
                     let our_ip = setup_dhcp(&group);
                     *shared.our_ip.lock_safe() = our_ip;
 
@@ -148,10 +142,29 @@ impl ConnectionHandler {
                         pin: pin.clone(),
                         peer_info: "Waiting for source...".to_string(),
                     });
-                    arm_wps_pin(&shared);
+                    shared.arm_current_pin();
                     log::info!("Listening on {group} with PIN {pin}");
 
-                    event_monitor_loop(shared);
+                    // The backend runs its own event source (a wpa_cli ATTACH
+                    // loop, or D-Bus signals) and feeds P2pEvents down a
+                    // channel; a second thread translates those into app events.
+                    let (tx, rx) = std::sync::mpsc::channel::<P2pEvent>();
+                    let drain = {
+                        let shared = Arc::clone(&shared);
+                        let group = group.clone();
+                        std::thread::Builder::new()
+                            .name("go-event-drain".to_string())
+                            .spawn(move || event_drain_loop(shared, group, rx))
+                            .expect("spawn go-event-drain")
+                    };
+
+                    shared
+                        .backend
+                        .run_event_monitor(&group, tx, &shared.running);
+
+                    // Backend monitor returned → stop the drain and join it.
+                    shared.running.store(false, Ordering::SeqCst);
+                    let _ = drain.join();
                 })
                 .expect("spawn go-event-monitor"),
         );
@@ -161,7 +174,6 @@ impl ConnectionHandler {
     pub fn stop_listening(&mut self) {
         self.shared.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.thread.take() {
-            // 5s join budget (matches Python join(timeout=5)); detach if slow.
             let start = Instant::now();
             while !handle.is_finished() && start.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(50));
@@ -181,8 +193,8 @@ impl ConnectionHandler {
 
     /// Generate a new PIN and re-arm WPS for the next connection.
     ///
-    /// Called from the GTK event drain, so the up-to-10s arm runs on a detached
-    /// thread rather than blocking the main loop.
+    /// Called from the GTK event drain, so the (possibly slow) arm runs on a
+    /// detached thread rather than blocking the main loop.
     pub fn rearm_wps_pin(&self) {
         let pin = generate_pin();
         *self.shared.current_pin.lock_safe() = Some(pin.clone());
@@ -192,7 +204,7 @@ impl ConnectionHandler {
         });
         let shared = Arc::clone(&self.shared);
         std::thread::spawn(move || {
-            arm_wps_pin(&shared);
+            shared.arm_current_pin();
             log::info!("Re-armed WPS with new PIN {pin}");
         });
     }
@@ -206,183 +218,36 @@ impl Drop for ConnectionHandler {
     }
 }
 
-/// Arm the WPS registrar on the group interface with the current PIN.
-/// Retries up to 10 times with 1s delays (control socket may not be ready).
-fn arm_wps_pin(shared: &Arc<Shared>) {
-    let group = shared.group_interface.lock_safe().clone();
-    let pin = shared.current_pin.lock_safe().clone();
-    let ctrl = shared.ctrl_path.lock_safe().clone();
-    let (group, pin) = match (group, pin) {
-        (Some(g), Some(p)) => (g, p),
-        _ => return,
-    };
-
-    for attempt in 0..10 {
-        match run_wpa_cli(&group, &["wps_pin", "any", &pin], false, ctrl.as_deref()) {
-            Ok(result) if !result.contains("FAIL") => {
-                log::info!("WPS PIN armed: {pin} on {group} (attempt {})", attempt + 1);
-                return;
-            }
-            Ok(_) => log::debug!("wps_pin attempt {} failed, retrying...", attempt + 1),
-            Err(e) => log::debug!("wps_pin attempt {} error: {e}", attempt + 1),
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    log::error!("Failed to arm WPS PIN after 10 attempts");
-    let _ = shared.events.send(Event::ConnectionError(
-        "Failed to arm WPS PIN — group interface not ready".to_string(),
-    ));
-}
-
-/// Monitor the GROUP interface for AP-STA-CONNECTED events.
-fn event_monitor_loop(shared: Arc<Shared>) {
-    let group = shared
-        .group_interface
-        .lock_safe()
-        .clone()
-        .unwrap_or_default();
-    let ctrl = shared.ctrl_path.lock_safe().clone();
-    log::info!("Event monitor starting on group interface {group}");
-
-    let mut cmd = Command::new("sudo");
-    cmd.arg("wpa_cli");
-    if let Some(p) = &ctrl {
-        cmd.arg("-p").arg(p);
-    }
-    cmd.arg("-i").arg(&group);
-
-    let mut proc = match cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("Failed to start wpa_cli: {e}");
-            let _ = shared.events.send(Event::ConnectionError(format!(
-                "Failed to start event monitor: {e}"
-            )));
-            return;
-        }
-    };
-
-    // Wait for the process to be ready.
-    std::thread::sleep(Duration::from_millis(500));
-    if let Ok(Some(_)) = proc.try_wait() {
-        let stderr = proc
-            .stderr
-            .take()
-            .map(|mut e| {
-                let mut s = String::new();
-                let _ = e.read_to_string(&mut s);
-                s
-            })
-            .unwrap_or_default();
-        log::error!("wpa_cli exited immediately: {}", stderr.trim());
-        let _ = shared.events.send(Event::ConnectionError(format!(
-            "wpa_cli failed: {}",
-            stderr.trim()
-        )));
-        return;
-    }
-
-    let stdout = proc.stdout.take().expect("piped stdout");
-    let mut reader = BufReader::new(stdout);
-
-    // Drain banner, then ATTACH.
-    drain_banner(&mut reader);
-    if let Some(stdin) = proc.stdin.as_mut() {
-        let _ = stdin.write_all(b"ATTACH\n");
-        let _ = stdin.flush();
-    }
-    std::thread::sleep(Duration::from_millis(500));
-    drain_output(&mut reader, Duration::from_secs(1));
-
-    log::info!("Event monitor attached to {group} — waiting for connections");
-
-    let mut last_rearm = Instant::now();
-
+/// Translate backend [`P2pEvent`]s into app [`Event`]s (DHCP, peer IP, WPS
+/// re-arm). Runs on its own thread so a slow DHCP-lease wait never blocks the
+/// backend's event source.
+fn event_drain_loop(shared: Arc<Shared>, group: String, rx: Receiver<P2pEvent>) {
     while shared.running.load(Ordering::SeqCst) {
-        if last_rearm.elapsed() >= WPS_REARM_INTERVAL {
-            arm_wps_pin(&shared);
-            last_rearm = Instant::now();
-        }
-
-        // Poll for a line with a ~1s cadence. BufRead has no timeout, so we
-        // read line-by-line; wpa_cli in ATTACH mode streams events promptly,
-        // and the running flag is re-checked each iteration.
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => {
-                if let Ok(Some(_)) = proc.try_wait() {
-                    log::error!("wpa_cli process died");
-                    break;
-                }
-                continue;
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(P2pEvent::PeerConnected { mac }) => handle_sta_connected(&shared, &mac, &group),
+            Ok(P2pEvent::PeerDisconnected) => handle_sta_disconnected(&shared),
+            Ok(P2pEvent::WpsPinNeeded) => {
+                let pin = shared.current_pin.lock_safe().clone().unwrap_or_default();
+                log::warn!("WPS re-arm requested: PIN {pin}");
+                shared.arm_current_pin();
             }
-        }
-
-        let mut line = line.trim().to_string();
-        if line.is_empty() || line == ">" || line == "> " {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("> ") {
-            line = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix('>') {
-            line = rest.to_string();
-        }
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.contains("AP-STA")
-            || line.contains("P2P")
-            || line.contains("WPS")
-            || line.contains("CTRL")
-        {
-            log::info!("GO event: {line}");
-        }
-
-        if let Some(cap) = ap_sta_connected_re().captures(&line) {
-            let peer_mac = cap[1].to_string();
-            handle_sta_connected(&shared, &peer_mac, &group);
-            continue;
-        }
-        if line.contains("WPS-PIN-NEEDED") {
-            let pin = shared.current_pin.lock_safe().clone().unwrap_or_default();
-            log::warn!("WPS-PIN-NEEDED: re-arming PIN {pin}");
-            arm_wps_pin(&shared);
-            continue;
-        }
-        if ap_sta_disconnected_re().is_match(&line) {
-            handle_sta_disconnected(&shared);
-            continue;
-        }
-        if line.contains("P2P-GROUP-REMOVED") {
-            log::info!("P2P group removed");
-            break;
+            Ok(P2pEvent::GroupRemoved) => {
+                log::info!("P2P group removed");
+                break;
+            }
+            Ok(P2pEvent::Error(e)) => {
+                let _ = shared.events.send(Event::ConnectionError(e));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-
-    // Cleanup: QUIT, terminate, kill.
-    if let Some(stdin) = proc.stdin.as_mut() {
-        let _ = stdin.write_all(b"QUIT\n");
-        let _ = stdin.flush();
-    }
-    let _ = proc.kill();
-    let _ = proc.wait();
-    log::info!("Event monitor thread exiting");
 }
 
 fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
     log::info!("Source connected: {peer_mac}");
     let our_ip = shared.our_ip.lock_safe().clone();
 
-    // Wait for DHCP lease (up to 15s), else fall back to the first range IP.
     let peer_ip = wait_for_dhcp_lease(shared, peer_mac, group, Duration::from_secs(15))
         .unwrap_or_else(|| {
             log::warn!("Could not find DHCP lease for {peer_mac}, using {FALLBACK_PEER_IP}");
@@ -421,7 +286,6 @@ fn wait_for_dhcp_lease(
     let mac_lower = peer_mac.to_lowercase();
 
     while Instant::now() < deadline && shared.running.load(Ordering::SeqCst) {
-        // dnsmasq leases file.
         if let Ok(content) = std::fs::read_to_string("/var/lib/misc/dnsmasq.leases") {
             for line in content.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -430,7 +294,6 @@ fn wait_for_dhcp_lease(
                 }
             }
         }
-        // ARP / neighbour table.
         if let Ok(out) = Command::new("ip")
             .args(["neigh", "show", "dev", group])
             .output()
@@ -461,7 +324,7 @@ fn handle_sta_disconnected(shared: &Arc<Shared>) {
         // Re-arm WPS for the next connection.
         let pin = generate_pin();
         *shared.current_pin.lock_safe() = Some(pin.clone());
-        arm_wps_pin(shared);
+        shared.arm_current_pin();
         let _ = shared.events.send(Event::PinDisplay {
             pin: pin.clone(),
             peer_info: "Waiting for source...".to_string(),
@@ -471,11 +334,10 @@ fn handle_sta_disconnected(shared: &Arc<Shared>) {
 }
 
 /// Set up IP addressing on the group interface: static IP + dnsmasq DHCP.
-/// Returns our IP. Uses the exact argv from the Python source.
+/// Returns our IP. (Still subprocess — IP/DHCP is Phase 3, not Phase 2.)
 fn setup_dhcp(iface: &str) -> String {
     let our_ip = OUR_IP.to_string();
 
-    // Kill any stale dnsmasq on this interface from previous runs.
     let _ = Command::new("sudo")
         .args(["pkill", "-f", &format!("dnsmasq.*{iface}")])
         .output();
@@ -491,15 +353,14 @@ fn setup_dhcp(iface: &str) -> String {
         .args(["ip", "link", "set", iface, "up"])
         .output();
 
-    // Start dnsmasq for DHCP with router option (identical argv).
     let spawn = Command::new("sudo")
         .args([
             "dnsmasq",
             &format!("--interface={iface}"),
             "--bind-interfaces",
             "--dhcp-range=192.168.173.80,192.168.173.90,255.255.255.0,5m",
-            &format!("--dhcp-option=3,{our_ip}"), // Router/gateway
-            &format!("--dhcp-option=6,{our_ip}"), // DNS
+            &format!("--dhcp-option=3,{our_ip}"),
+            &format!("--dhcp-option=6,{our_ip}"),
             "--no-daemon",
             "--log-facility=-",
             "--except-interface=lo",
@@ -517,43 +378,6 @@ fn setup_dhcp(iface: &str) -> String {
     our_ip
 }
 
-/// Read and discard the wpa_cli banner lines.
-fn drain_banner<R: BufRead>(reader: &mut R) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                let stripped = line.trim();
-                if stripped.contains("Interactive mode") || stripped == ">" {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Read and discard output for a given timeout.
-fn drain_output<R: BufRead>(reader: &mut R, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn terminate(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,19 +389,5 @@ mod tests {
             assert_eq!(pin.len(), 8);
             assert!(pin.chars().all(|c| c.is_ascii_digit()));
         }
-    }
-
-    #[test]
-    fn ap_sta_connected_pattern_extracts_mac() {
-        let caps = ap_sta_connected_re()
-            .captures("<3>AP-STA-CONNECTED 00:11:22:33:44:55 p2p_dev_addr=...")
-            .unwrap();
-        assert_eq!(&caps[1], "00:11:22:33:44:55");
-    }
-
-    #[test]
-    fn ap_sta_disconnected_pattern_matches() {
-        assert!(ap_sta_disconnected_re().is_match("<3>AP-STA-DISCONNECTED aa:bb:cc:dd:ee:ff"));
-        assert!(!ap_sta_disconnected_re().is_match("AP-STA-CONNECTED aa:bb:cc:dd:ee:ff"));
     }
 }

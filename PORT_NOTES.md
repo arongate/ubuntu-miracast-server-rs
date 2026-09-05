@@ -140,6 +140,38 @@ Following an ISO/IEC 25010 review, three hardening changes were made:
   `recv_message` resilient to partial reads (it currently treats any incomplete
   read as a fatal `None`), which would let the test run deterministically.
 
+## Native-backend migration (dropping subprocess + root)
+
+Following `docs/native-dbus-research.md`, the P2P control plane is moving off
+`wpa_cli`/subprocess onto native APIs, in phases, without breaking the proven
+path:
+
+- **Phase 1 (done):** `ethtool -i` → sysfs `/sys/class/net/<iface>/device/driver`;
+  `systemctl --user` → `org.freedesktop.systemd1` on the session bus via
+  `zbus::blocking`. No subprocess, unprivileged, behaviour unchanged.
+- **Phase 2 (done):** the P2P control plane is behind a `P2pBackend` trait
+  (`src/p2p_backend.rs`) with two impls:
+  - `cli` — the original `wpa_cli` subprocess path (default, hardware-validated):
+    a faithful relocation of the advertiser sequence + WPS arm + ATTACH loop.
+  - `dbus` (feature `dbus-backend`) — `fi.w1.wpa_supplicant1` over the system bus
+    via `zbus::blocking`: writes `WFDIEs`, sets `P2PDeviceConfig`, calls
+    `P2PDevice.Find`/`GroupAdd` + `WPS.Start`, and consumes
+    `GroupStarted`/`PeerJoined`/`PeerDisconnected`/`GroupFinished` signals
+    instead of scraping stdout. Event-driven, no `ip link` polling.
+  `advertiser.rs`/`connection.rs` call the trait and consume typed `P2pEvent`s.
+  Backend selection is runtime: `wpa_cli` by default, D-Bus only when the
+  `dbus-backend` feature is compiled AND `MIRACAST_BACKEND=dbus` is set. D-Bus
+  access is `netdev`-group-gated (no polkit, no sudo).
+
+  **Not yet hardware-tested:** the D-Bus backend build-checks, passes clippy
+  `-D warnings`, and its byte-assembly unit tests pass, but the live P2P
+  handshake has only run on the `wpa_cli` path. One field to confirm on
+  hardware: peer MAC is read from `Peer.DeviceAddress`; if named differently,
+  `peer_mac_from_signal` logs and skips (non-fatal) rather than connecting.
+- **Phase 3 (pending):** IP + DHCP (`ip`, `dnsmasq`) — still subprocess; the only
+  remaining root requirement. Options in the research doc (NetworkManager shared
+  mode vs `setcap` + native rtnetlink/in-proc DHCP).
+
 ## CI / release
 
 - `.github/workflows/ci.yml` — matrix of `--no-default-features` (headless core)
