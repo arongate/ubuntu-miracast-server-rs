@@ -519,7 +519,18 @@ fn remove_stale_p2p_groups(parent_iface: &str) {
         }
         match crate::utils::run_wpa_cli(parent_iface, &["p2p_group_remove", grp], false, None) {
             Ok(_) => removed += 1,
-            Err(e) => log::debug!("stale group {grp} remove failed (ignored): {e}"),
+            Err(e) => log::debug!("stale group {grp} p2p_group_remove failed (ignored): {e}"),
+        }
+        // p2p_group_remove is a no-op on an ORPHANED netdev (one wpa_supplicant
+        // no longer tracks — verified in the field: such interfaces linger in
+        // `state DOWN`, are absent from the D-Bus Interfaces list, yet still
+        // count against the driver's P2P limit and make GroupAdd fail). Force a
+        // netlink RTM_DELLINK via `ip link delete`; needs CAP_NET_ADMIN (which
+        // the native-net setcap grants) — best-effort otherwise.
+        if std::path::Path::new(&format!("/sys/class/net/{grp}")).exists() {
+            let _ = std::process::Command::new("ip")
+                .args(["link", "delete", grp])
+                .output();
         }
     }
     if removed > 0 {
