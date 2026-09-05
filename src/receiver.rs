@@ -280,6 +280,11 @@ impl PipelineBuilder {
         q.set_property("max-size-buffers", QUEUE_MAX_BUFFERS);
         q.set_property("max-size-bytes", QUEUE_MAX_BYTES);
         q.set_property("max-size-time", QUEUE_MAX_TIME);
+        // NOT leaky: this queue feeds h264parse→decoder, so it carries COMPRESSED
+        // frames. Dropping a compressed frame loses a reference/NAL unit and
+        // corrupts decode downstream (blocky/green artifacts) — worse than a
+        // brief stall. Frame-dropping, if needed, belongs at the SINK via QoS,
+        // which we deliberately disable to preserve quality.
         Ok(q)
     }
 
@@ -299,7 +304,12 @@ impl PipelineBuilder {
             .name("videodec")
             .build()
             .map_err(|_| "Failed to create video decoder (avdec_h264)".to_string())?;
-        log::info!("Using software decoder: avdec_h264");
+        // Multi-threaded decode so 1080p keeps up in software (single-threaded
+        // avdec_h264 falling behind real time shows as stutter/poor quality).
+        // max-threads=0 = auto (all cores); prefer low-latency slice threading.
+        set_if_has(&dec, "max-threads", 0i32);
+        set_if_has(&dec, "std-compliance", 0i32);
+        log::info!("Using software decoder: avdec_h264 (multi-threaded)");
         Ok(dec)
     }
 
@@ -314,6 +324,10 @@ impl PipelineBuilder {
             .name("videosink")
             .build()
         {
+            // Disable QoS: with software decode marginally behind real time, a
+            // QoS-enabled sink tells upstream to DROP frames to catch up, which
+            // shows as stutter / smeared quality. Prefer keeping frames.
+            set_if_has(&sink, "qos", false);
             log::info!("Using gtk4paintablesink for video output");
             return Ok(sink);
         }
@@ -321,6 +335,7 @@ impl PipelineBuilder {
             .name("videosink")
             .build()
             .map_err(|_| "Failed to create video sink element".to_string())?;
+        set_if_has(&sink, "qos", false);
         log::info!("Using autovideosink for video output");
         Ok(sink)
     }
@@ -331,6 +346,15 @@ fn make(factory: &str, name: &str) -> Result<gst::Element, String> {
         .name(name)
         .build()
         .map_err(|_| format!("Failed to create {factory} element"))
+}
+
+/// Set a property only if the element actually exposes it. GStreamer element
+/// properties vary by version/plugin build, so a hard `set_property` on a
+/// missing property panics — this no-ops instead, keeping tuning best-effort.
+fn set_if_has(el: &gst::Element, name: &str, value: impl Into<gst::glib::Value>) {
+    if el.find_property(name).is_some() {
+        el.set_property(name, value.into());
+    }
 }
 
 /// Shared, thread-safe receiver state (counters updated from probe + threads).
