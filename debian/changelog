@@ -1,0 +1,11 @@
+ubuntu-miracast-server (0.1.0~beta1-1) unstable; urgency=medium
+
+  * First beta release.
+  * Miracast sink with full RTSP negotiation (M1-M7).
+  * Autonomous P2P Group Owner mode.
+  * Samsung Galaxy Smart View tested and working.
+  * GTK 4 + libadwaita UI with inline PIN display.
+  * GStreamer H.264/AAC decode pipeline.
+  * Dedicated wpa_supplicant on secondary USB Wi-Fi adapter.
+
+ -- Eddy Arrel <eddy.arrel@gmail.com>  Sun, 23 Aug 2026 18:00:00 +0200

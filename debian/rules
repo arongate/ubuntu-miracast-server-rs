@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export DESTDIR = $(CURDIR)/debian/ubuntu-miracast-server
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked --features gui
+
+override_dh_auto_test:
+	cargo test --release --locked --features gui
+
+override_dh_auto_install:
+	install -Dm755 target/release/ubuntu-miracast-server \
+		$(DESTDIR)/usr/bin/ubuntu-miracast-server
+	install -Dm644 debian/ubuntu-miracast-server.desktop \
+		$(DESTDIR)/usr/share/applications/ubuntu-miracast-server.desktop
+
+override_dh_auto_clean:
+	cargo clean || true

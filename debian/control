@@ -1,0 +1,41 @@
+Source: ubuntu-miracast-server
+Section: video
+Priority: optional
+Maintainer: Eddy Arrel <eddy.arrel@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc (>= 1.75),
+               pkg-config,
+               libgtk-4-dev,
+               libadwaita-1-dev,
+               libgstreamer1.0-dev,
+               libgstreamer-plugins-base1.0-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/arongate/ubuntu-miracast-server
+Rules-Requires-Root: no
+
+Package: ubuntu-miracast-server
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-plugins-bad,
+         wpasupplicant,
+         dnsmasq
+Recommends: gstreamer1.0-vaapi
+Description: Miracast server (sink) for Ubuntu
+ Ubuntu Miracast Server is a desktop application that acts as a
+ Miracast sink — receiving wireless screen casts from Miracast
+ source devices over Wi-Fi Direct.
+ .
+ This is a Rust port of the original Python/PyGObject application,
+ preserving identical functional and non-functional behaviour.
+ .
+ Features:
+  * Receive Miracast wireless display streams
+  * Automatic device discovery via Wi-Fi Direct P2P
+  * Hardware-accelerated video decoding (VAAPI/NVDEC)
+  * Audio support (AAC)
+  * Session history tracking
+  * Optional headless systemd user service mode
+  * GTK 4 / libadwaita user interface
