@@ -127,6 +127,18 @@ impl PipelineBuilder {
         .map_err(|e| format!("bad caps: {e}"))?;
         udpsrc.set_property("caps", &caps);
 
+        // RTP jitter buffer: reorders out-of-order UDP packets and paces them
+        // out. Tuned for LIVE low latency — the default would buffer and can
+        // grow, adding lag. A short bounded latency (80ms) absorbs Wi-Fi jitter;
+        // drop-on-latency skips a packet that arrives too late instead of
+        // stalling the stream (which is what accumulates delay on a P2P link);
+        // do-lost lets the decoder conceal a gap rather than freeze.
+        let jitterbuffer = make("rtpjitterbuffer", "jitterbuffer")?;
+        set_if_has(&jitterbuffer, "latency", 80u32); // ms
+        set_if_has(&jitterbuffer, "drop-on-latency", true);
+        set_if_has(&jitterbuffer, "do-lost", true);
+        set_if_has(&jitterbuffer, "mode", 4i32); // 4 = synced (low-latency)
+
         let rtpdepay = make("rtpmp2tdepay", "rtpdepay")?;
         let tsdemux = make("tsdemux", "demux")?;
 
@@ -139,6 +151,7 @@ impl PipelineBuilder {
 
         let mut elems = vec![
             udpsrc.clone(),
+            jitterbuffer.clone(),
             rtpdepay.clone(),
             tsdemux.clone(),
             video_queue.clone(),
@@ -152,8 +165,11 @@ impl PipelineBuilder {
         }
 
         udpsrc
+            .link(&jitterbuffer)
+            .map_err(|e| format!("link udpsrc→jitterbuffer: {e}"))?;
+        jitterbuffer
             .link(&rtpdepay)
-            .map_err(|e| format!("link udpsrc→rtpdepay: {e}"))?;
+            .map_err(|e| format!("link jitterbuffer→rtpdepay: {e}"))?;
         rtpdepay
             .link(&tsdemux)
             .map_err(|e| format!("link rtpdepay→tsdemux: {e}"))?;
