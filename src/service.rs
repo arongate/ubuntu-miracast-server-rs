@@ -272,7 +272,18 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
     log::info!("CapabilityReport: {}", caps.report());
 
     // Service mode uses the system wpa_supplicant (no dedicated ctrl path).
-    let backend = crate::p2p_backend::select_backend(None, iface.clone(), caps.go_freq_mhz);
+    let won_resolution = std::sync::Arc::new(std::sync::Mutex::new(
+        caps.go_candidates
+            .first()
+            .map(|c| c.max_resolution)
+            .unwrap_or((1280, 720)),
+    ));
+    let backend = crate::p2p_backend::select_backend(
+        None,
+        iface.clone(),
+        caps.go_candidates.clone(),
+        std::sync::Arc::clone(&won_resolution),
+    );
     let mut advertiser = MiracastAdvertiser::new(
         name.clone(),
         rtsp_port,
@@ -286,7 +297,7 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
         true,
         audio_enabled,
         tx.clone(),
-        caps.max_resolution,
+        std::sync::Arc::clone(&won_resolution),
     );
     let mut handler: Option<ConnectionHandler> = None;
 

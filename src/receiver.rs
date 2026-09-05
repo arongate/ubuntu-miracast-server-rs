@@ -458,7 +458,7 @@ pub struct MiracastReceiver {
     headless: bool,
     audio_enabled: bool,
     events: EventSender,
-    max_resolution: (u32, u32),
+    max_resolution: Arc<Mutex<(u32, u32)>>,
 
     state: Arc<RxState>,
     pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
@@ -481,7 +481,7 @@ impl MiracastReceiver {
         headless: bool,
         audio_enabled: bool,
         events: EventSender,
-        max_resolution: (u32, u32),
+        max_resolution: Arc<Mutex<(u32, u32)>>,
     ) -> Self {
         gst_init();
         Self {
@@ -546,7 +546,7 @@ impl MiracastReceiver {
             headless: self.headless,
             audio_enabled: self.audio_enabled,
             events: self.events.clone(),
-            max_resolution: self.max_resolution,
+            max_resolution: Arc::clone(&self.max_resolution),
             state: Arc::clone(&self.state),
             pipeline: Arc::clone(&self.pipeline),
             epoch: self.epoch,
@@ -632,7 +632,7 @@ struct SessionCtx {
     headless: bool,
     audio_enabled: bool,
     events: EventSender,
-    max_resolution: (u32, u32),
+    max_resolution: Arc<Mutex<(u32, u32)>>,
     state: Arc<RxState>,
     pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     epoch: Instant,
@@ -881,7 +881,7 @@ impl SessionCtx {
         let mut msg =
             format!("wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n");
         msg.push_str("wfd_audio_codecs: AAC 00000001 00\r\n");
-        let (mw, mh) = self.max_resolution;
+        let (mw, mh) = *self.max_resolution.lock_safe();
         let vfmt = crate::rtsp::WfdVideoFormat::for_max_resolution(mw, mh).to_wfd_string();
         msg.push_str(&format!("wfd_video_formats: {vfmt}\r\n"));
         msg.push_str("wfd_3d_video_formats: none\r\n");
@@ -1371,7 +1371,7 @@ mod tests {
             headless: true,
             audio_enabled: true,
             events: tx,
-            max_resolution: (1920, 1080),
+            max_resolution: Arc::new(Mutex::new((1920, 1080))),
             state: Arc::new(RxState::new()),
             pipeline: Arc::new(Mutex::new(None)),
             epoch: Instant::now(),

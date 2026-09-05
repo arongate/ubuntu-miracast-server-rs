@@ -55,9 +55,11 @@ pub struct WpaCliBackend {
     ctrl_path: Option<String>,
     /// Resolved P2P device interface (set on first `ensure_interface`).
     p2p_interface: std::sync::Mutex<Option<String>>,
-    /// GO operating frequency in MHz (capability-detected). 0 = let the driver
-    /// choose (no `freq=` arg).
-    go_freq_mhz: u32,
+    /// Ordered GO bring-up ladder (capability-detected). Empty = single default.
+    go_candidates: Vec<crate::capabilities::GoCandidate>,
+    /// Shared cell the receiver reads for its advertised resolution; set to the
+    /// winning candidate's resolution once a GO comes up.
+    won_resolution: std::sync::Arc<std::sync::Mutex<(u32, u32)>>,
 }
 
 impl WpaCliBackend {
@@ -65,13 +67,20 @@ impl WpaCliBackend {
         Self {
             ctrl_path,
             p2p_interface: std::sync::Mutex::new(None),
-            go_freq_mhz: 0,
+            go_candidates: Vec::new(),
+            won_resolution: std::sync::Arc::new(std::sync::Mutex::new((1280, 720))),
         }
     }
 
-    /// Seed the capability-detected GO operating frequency (MHz).
-    pub fn with_go_freq(mut self, mhz: u32) -> Self {
-        self.go_freq_mhz = mhz;
+    /// Seed the capability-detected GO bring-up ladder + the shared resolution
+    /// cell updated to the winning rung's resolution.
+    pub fn with_go_candidates(
+        mut self,
+        candidates: Vec<crate::capabilities::GoCandidate>,
+        won_resolution: std::sync::Arc<std::sync::Mutex<(u32, u32)>>,
+    ) -> Self {
+        self.go_candidates = candidates;
+        self.won_resolution = won_resolution;
         self
     }
 
@@ -143,84 +152,103 @@ impl P2pBackend for WpaCliBackend {
         self.wpa(&["p2p_find", "type=progressive"], None, true)?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
-        // Snapshot existing p2p-* netdevs BEFORE creating the group, so we can
-        // identify the one WE create and not latch onto a stale leftover.
-        let pre_existing = snapshot_group_interfaces();
-        if !pre_existing.is_empty() {
-            log::debug!("Pre-existing P2P group interfaces: {pre_existing:?}");
-        }
+        // Phase 1 — GO bring-up ladder. Walk the capability-detected candidates
+        // (2.4GHz social ch1/6/11 → driver-chosen; 5GHz only if opted in), and
+        // use the FIRST whose GO actually comes up and reports the expected
+        // band. Each rung: snapshot → p2p_group_add freq=… → wait for a NEW
+        // p2p-* iface → verify operating freq. On failure, tear the rung down
+        // and try the next. Records the winning rung's resolution for the
+        // receiver to advertise.
+        let candidates = if self.go_candidates.is_empty() {
+            // Safe default ladder if none were seeded.
+            vec![
+                crate::capabilities::GoCandidate {
+                    freq_mhz: 2412,
+                    band: crate::capabilities::GoBand::Band24,
+                    max_resolution: (1280, 720),
+                    label: "2.4GHz ch1",
+                },
+                crate::capabilities::GoCandidate {
+                    freq_mhz: 0,
+                    band: crate::capabilities::GoBand::Band24,
+                    max_resolution: (1280, 720),
+                    label: "driver-chosen",
+                },
+            ]
+        } else {
+            self.go_candidates.clone()
+        };
 
-        // Create the autonomous GO on the capability-detected operating channel
-        // (best clean 5GHz channel when the radio allows it → full bandwidth;
-        // else a 2.4GHz social channel). Discovery still works because the
-        // device stays in P2P Listen via extended-listen below. Fallback chain
-        // keeps the GO coming up even if the preferred freq is rejected.
-        let mut freq_attempts: Vec<String> = Vec::new();
-        if self.go_freq_mhz > 0 {
-            freq_attempts.push(format!("freq={}", self.go_freq_mhz));
-        }
-        freq_attempts.push("freq=2412".to_string()); // 2.4GHz social ch1 fallback
-        freq_attempts.push(String::new()); // last resort: let the driver choose
-
-        let mut created = false;
-        for (i, freq) in freq_attempts.iter().enumerate() {
-            let args: Vec<&str> = if freq.is_empty() {
+        let mut group_iface: Option<String> = None;
+        for cand in &candidates {
+            let pre = snapshot_group_interfaces();
+            let args: Vec<&str> = if cand.freq_mhz == 0 {
                 vec!["p2p_group_add", "persistent"]
             } else {
-                vec!["p2p_group_add", "persistent", freq.as_str()]
+                vec![
+                    "p2p_group_add",
+                    "persistent",
+                    Box::leak(format!("freq={}", cand.freq_mhz).into_boxed_str()),
+                ]
             };
             let result = self.wpa(&args, None, false)?;
-            if !result.contains("FAIL") {
-                if i > 0 {
-                    log::warn!(
-                        "p2p_group_add fell back to '{}' (preferred freq rejected)",
-                        if freq.is_empty() {
-                            "driver-chosen"
-                        } else {
-                            freq
-                        }
-                    );
+            if result.contains("FAIL") {
+                log::warn!("GO rung '{}' rejected by p2p_group_add; next", cand.label);
+                continue;
+            }
+            let Some(iface) = wait_for_group_interface(Duration::from_secs(10), &pre) else {
+                log::warn!(
+                    "GO rung '{}' — group iface did not appear; next",
+                    cand.label
+                );
+                continue;
+            };
+            // Verify the operating frequency matches the rung's band (a P2P-GO
+            // exposes freq only via `wpa_cli status`, not `iw dev info`).
+            let freq_ok = match self.wpa(&["status"], Some(&iface), true) {
+                Ok(status) => {
+                    let freq = status
+                        .lines()
+                        .find_map(|l| l.strip_prefix("freq="))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    log::info!("GO rung '{}' up on {iface} (freq={freq} MHz)", cand.label);
+                    // Accept if we can't read it; only reject an obvious band
+                    // mismatch (asked 2.4GHz, got 5GHz or vice-versa).
+                    match cand.band {
+                        crate::capabilities::GoBand::Band24 => !freq.starts_with('5'),
+                        crate::capabilities::GoBand::Band5 => freq.starts_with('5'),
+                    }
                 }
-                created = true;
-                break;
+                Err(_) => true, // status unreadable → accept, do not thrash
+            };
+            if !freq_ok {
+                log::warn!(
+                    "GO rung '{}' came up on the wrong band; tearing down, next",
+                    cand.label
+                );
+                let _ = self.wpa(&["p2p_group_remove", &iface], None, false);
+                continue;
             }
-            log::warn!("p2p_group_add '{freq}' failed ({result}); trying next");
+            // Winner. Record the resolution the receiver should advertise.
+            *self
+                .won_resolution
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = cand.max_resolution;
+            let (rw, rh) = cand.max_resolution;
+            log::info!(
+                "GO bring-up succeeded on rung '{}' ({iface}); advertising {rw}x{rh}",
+                cand.label
+            );
+            group_iface = Some(iface);
+            break;
         }
-        if !created {
-            return Err(super::BackendError::Runtime(
-                "p2p_group_add failed on all frequency attempts".to_string(),
-            ));
-        }
-        log::info!("p2p_group_add issued, waiting for group interface...");
-
-        let group_iface = wait_for_group_interface(Duration::from_secs(10), &pre_existing)
-            .ok_or_else(|| {
-                super::BackendError::Runtime(
-                    "P2P group interface did not appear within 10 seconds".to_string(),
-                )
-            })?;
+        let group_iface = group_iface.ok_or_else(|| {
+            super::BackendError::Runtime(
+                "GO bring-up failed on all candidate configs (see per-rung warnings)".to_string(),
+            )
+        })?;
         log::info!("P2P GO created on interface: {group_iface}");
-
-        // Report the GO's operating frequency so discovery health is visible at
-        // a glance: a phone finds the sink via P2P discovery on the 2.4GHz
-        // social channels, so the GO should be ~2412MHz. (wpa_cli status on the
-        // group iface reports freq=; iw dev <go> info does NOT.)
-        if let Ok(status) = self.wpa(&["status"], Some(&group_iface), true) {
-            if let Some(freq) = status
-                .lines()
-                .find_map(|l| l.strip_prefix("freq="))
-                .map(str::trim)
-            {
-                let band = if freq.starts_with("24") {
-                    "2.4GHz — good for P2P discovery"
-                } else if freq.starts_with('5') {
-                    "5GHz — phones may NOT discover the sink here"
-                } else {
-                    "unknown band"
-                };
-                log::info!("P2P GO operating frequency: {freq} MHz ({band})");
-            }
-        }
 
         // Best-effort: set WFD subelements on the group interface too.
         if let Err(e) = self.wpa(&["set", "wifi_display", "1"], Some(&group_iface), false) {

@@ -122,7 +122,8 @@ pub mod dbus;
 pub fn select_backend(
     ctrl_path: Option<String>,
     iface: Option<String>,
-    go_freq_mhz: u32,
+    go_candidates: Vec<crate::capabilities::GoCandidate>,
+    won_resolution: std::sync::Arc<std::sync::Mutex<(u32, u32)>>,
 ) -> std::sync::Arc<dyn P2pBackend> {
     #[cfg(feature = "dbus-backend")]
     {
@@ -145,6 +146,6 @@ pub fn select_backend(
     std::sync::Arc::new(
         cli::WpaCliBackend::new(ctrl_path)
             .with_interface(iface)
-            .with_go_freq(go_freq_mhz),
+            .with_go_candidates(go_candidates, won_resolution),
     )
 }

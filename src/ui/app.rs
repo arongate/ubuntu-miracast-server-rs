@@ -132,12 +132,23 @@ fn activate(
     // dedicated supplicant's interface (falling back to the configured one) so
     // it drives that instance's control socket, not the system supplicant's,
     // and with the capability-detected GO operating frequency.
+    // Shared cell the backend sets to the winning GO rung's resolution and the
+    // receiver reads when it advertises capabilities (M3). Seed with the first
+    // candidate's resolution as a sane default before any GO comes up.
+    let won_resolution = Arc::new(std::sync::Mutex::new(
+        caps.go_candidates
+            .first()
+            .map(|c| c.max_resolution)
+            .unwrap_or((1280, 720)),
+    ));
+
     let backend = crate::p2p_backend::select_backend(
         ctrl_path.clone(),
         effective_interface
             .clone()
             .or_else(|| p2p_interface.clone()),
-        caps.go_freq_mhz,
+        caps.go_candidates.clone(),
+        Arc::clone(&won_resolution),
     );
 
     let advertiser = Rc::new(RefCell::new(MiracastAdvertiser::new(
@@ -155,7 +166,7 @@ fn activate(
         false,
         audio_enabled,
         tx.clone(),
-        caps.max_resolution,
+        Arc::clone(&won_resolution),
     )));
 
     // Build views + window.
