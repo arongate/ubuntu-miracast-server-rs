@@ -287,7 +287,12 @@ fn handle_event(state: &Rc<App>, event: Event) {
         }
         Event::StreamError(msg) => {
             win.set_status("Stream error");
-            if let Some(si) = state.receiver.borrow().source_info() {
+            // Take source_info in its own scope so the immutable borrow is
+            // released before stop_receiving() takes a mutable borrow — the
+            // `if let Some(_) = borrow()` guard would otherwise hold the shared
+            // borrow across borrow_mut() and panic "RefCell already borrowed".
+            let source_info = state.receiver.borrow().source_info();
+            if let Some(si) = source_info {
                 let stats = state.receiver.borrow_mut().stop_receiving();
                 state.history.borrow_mut().add_session(si, stats);
                 state.window.sessions().refresh();
