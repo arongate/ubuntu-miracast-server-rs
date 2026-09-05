@@ -30,7 +30,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, Value};
+use zbus::zvariant::{OwnedObjectPath, Value};
 
 use super::cli;
 use super::{BackendError, BackendResult, P2pBackend, P2pEvent};
@@ -179,11 +179,6 @@ impl P2pBackend for DbusBackend {
             .map_err(|e| BackendError::Runtime(format!("P2PDevice.Find failed: {e}")))?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
-        // Subscribe to GroupStarted BEFORE GroupAdd so we cannot miss it.
-        let mut group_started = p2p
-            .receive_signal("GroupStarted")
-            .map_err(|e| BackendError::Runtime(format!("subscribe GroupStarted failed: {e}")))?;
-
         // (d) GroupAdd({persistent: true}) — autonomous GO.
         let mut add_args: HashMap<&str, Value> = HashMap::new();
         add_args.insert("persistent", Value::from(true));
@@ -191,51 +186,33 @@ impl P2pBackend for DbusBackend {
             .map_err(|e| BackendError::Runtime(format!("P2PDevice.GroupAdd failed: {e}")))?;
         log::info!("p2p_group_add issued, waiting for group interface...");
 
-        // (e) Await GroupStarted; pull interface_object (o) from its a{sv} and
-        //     read that interface's Ifname. ~10s timeout.
+        // (e) Wait for the group interface to appear. The `GroupStarted` D-Bus
+        //     signal is unreliable on some wpa_supplicant/NM setups (and a
+        //     blocking signal `next()` has no timeout — it froze the GTK main
+        //     thread here), so poll `ip link` for the `p2p-*` interface with a
+        //     hard deadline, reusing the CLI backend's proven parser. This is a
+        //     bounded read; it never blocks past GROUP_STARTED_TIMEOUT.
         let deadline = Instant::now() + GROUP_STARTED_TIMEOUT;
         loop {
+            if let Ok(out) = std::process::Command::new("ip")
+                .args(["link", "show"])
+                .output()
+            {
+                if out.status.success() {
+                    if let Some(group_iface) =
+                        cli::parse_group_interface(&String::from_utf8_lossy(&out.stdout))
+                    {
+                        log::info!("P2P GO created on interface: {group_iface}");
+                        return Ok(group_iface);
+                    }
+                }
+            }
             if Instant::now() >= deadline {
                 return Err(BackendError::Runtime(
                     "P2P group interface did not appear within 10 seconds".to_string(),
                 ));
             }
-            // blocking iterator; each `next()` yields the next matching signal.
-            let msg = match group_started.next() {
-                Some(m) => m,
-                None => {
-                    return Err(BackendError::Runtime(
-                        "GroupStarted signal stream ended before group appeared".to_string(),
-                    ));
-                }
-            };
-            let body = msg.body();
-            // Signal body is a single a{sv} dictionary of properties.
-            let props: HashMap<String, Value> = match body.deserialize() {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("GroupStarted body parse failed, retrying: {e}");
-                    continue;
-                }
-            };
-            let iface_obj = match props.get("interface_object") {
-                Some(v) => match ObjectPath::try_from(v.try_clone().map_err(|e| {
-                    BackendError::Runtime(format!("GroupStarted value clone failed: {e}"))
-                })?) {
-                    Ok(p) => OwnedObjectPath::from(p),
-                    Err(_) => {
-                        log::debug!("GroupStarted.interface_object not an object path, retrying");
-                        continue;
-                    }
-                },
-                None => {
-                    log::debug!("GroupStarted missing interface_object, retrying");
-                    continue;
-                }
-            };
-            let group_iface = self.ifname_of(&iface_obj)?;
-            log::info!("P2P GO created on interface: {group_iface}");
-            return Ok(group_iface);
+            std::thread::sleep(Duration::from_millis(500));
         }
     }
 

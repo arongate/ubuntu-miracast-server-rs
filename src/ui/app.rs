@@ -176,9 +176,19 @@ fn activate(
         window.fullscreen();
     }
 
-    // Start advertising, then drain events on the main loop.
-    advertiser.borrow_mut().start_advertising();
+    // Drain component events on the main loop.
     start_event_drain(state.clone(), rx);
+
+    // Start advertising AFTER the window has had a chance to paint. The GO
+    // setup does a bounded-but-blocking wait for the group interface; running
+    // it synchronously here would delay the first paint (the user saw "no UI").
+    // Defer it to the next main-loop iteration so the window shows first.
+    {
+        let advertiser = advertiser.clone();
+        glib::idle_add_local_once(move || {
+            advertiser.borrow_mut().start_advertising();
+        });
+    }
 
     // Graceful shutdown on window close / application shutdown.
     {
