@@ -14,11 +14,11 @@
 
 use crate::events::{Event, EventSender};
 use crate::models::IncomingConnection;
+use crate::net_backend::NetBackend;
 use crate::p2p_backend::{P2pBackend, P2pEvent};
 use crate::sync_ext::LockExt;
 use chrono::Local;
 use rand::Rng;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,7 @@ struct Shared {
     our_ip: Mutex<String>,
     events: EventSender,
     backend: Arc<dyn P2pBackend>,
+    net: Arc<dyn NetBackend>,
 }
 
 impl Shared {
@@ -79,6 +80,7 @@ impl ConnectionHandler {
         auto_accept: bool,
         connection_timeout: i32,
         backend: Arc<dyn P2pBackend>,
+        net: Arc<dyn NetBackend>,
         events: EventSender,
     ) -> Self {
         Self {
@@ -90,6 +92,7 @@ impl ConnectionHandler {
                 our_ip: Mutex::new(OUR_IP.to_string()),
                 events,
                 backend,
+                net,
             }),
             thread: None,
             go_intent,
@@ -132,7 +135,7 @@ impl ConnectionHandler {
                 .name("go-event-monitor".to_string())
                 .spawn(move || {
                     // IP + DHCP first (before any client tries to connect).
-                    let our_ip = setup_dhcp(&group);
+                    let our_ip = shared.net.setup_dhcp(&group);
                     *shared.our_ip.lock_safe() = our_ip;
 
                     // Generate + arm the initial WPS PIN.
@@ -248,7 +251,9 @@ fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
     log::info!("Source connected: {peer_mac}");
     let our_ip = shared.our_ip.lock_safe().clone();
 
-    let peer_ip = wait_for_dhcp_lease(shared, peer_mac, group, Duration::from_secs(15))
+    let peer_ip = shared
+        .net
+        .wait_for_dhcp_lease(peer_mac, group, Duration::from_secs(15), &shared.running)
         .unwrap_or_else(|| {
             log::warn!("Could not find DHCP lease for {peer_mac}, using {FALLBACK_PEER_IP}");
             FALLBACK_PEER_IP.to_string()
@@ -276,41 +281,6 @@ fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
 }
 
 /// Wait for a DHCP lease for `peer_mac`. Polls dnsmasq leases and `ip neigh`.
-fn wait_for_dhcp_lease(
-    shared: &Arc<Shared>,
-    peer_mac: &str,
-    group: &str,
-    timeout: Duration,
-) -> Option<String> {
-    let deadline = Instant::now() + timeout;
-    let mac_lower = peer_mac.to_lowercase();
-
-    while Instant::now() < deadline && shared.running.load(Ordering::SeqCst) {
-        if let Ok(content) = std::fs::read_to_string("/var/lib/misc/dnsmasq.leases") {
-            for line in content.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 && parts[1].to_lowercase() == mac_lower {
-                    return Some(parts[2].to_string());
-                }
-            }
-        }
-        if let Ok(out) = Command::new("ip")
-            .args(["neigh", "show", "dev", group])
-            .output()
-        {
-            for line in String::from_utf8_lossy(&out.stdout).trim().lines() {
-                if line.to_lowercase().contains(&mac_lower) {
-                    if let Some(ip) = line.split_whitespace().next() {
-                        return Some(ip.to_string());
-                    }
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    None
-}
-
 fn handle_sta_disconnected(shared: &Arc<Shared>) {
     let was_connected = {
         let mut guard = shared.active_connection.lock_safe();
@@ -335,49 +305,6 @@ fn handle_sta_disconnected(shared: &Arc<Shared>) {
 
 /// Set up IP addressing on the group interface: static IP + dnsmasq DHCP.
 /// Returns our IP. (Still subprocess — IP/DHCP is Phase 3, not Phase 2.)
-fn setup_dhcp(iface: &str) -> String {
-    let our_ip = OUR_IP.to_string();
-
-    let _ = Command::new("sudo")
-        .args(["pkill", "-f", &format!("dnsmasq.*{iface}")])
-        .output();
-    std::thread::sleep(Duration::from_millis(300));
-
-    let _ = Command::new("sudo")
-        .args(["ip", "addr", "flush", "dev", iface])
-        .output();
-    let _ = Command::new("sudo")
-        .args(["ip", "addr", "add", &format!("{our_ip}/24"), "dev", iface])
-        .output();
-    let _ = Command::new("sudo")
-        .args(["ip", "link", "set", iface, "up"])
-        .output();
-
-    let spawn = Command::new("sudo")
-        .args([
-            "dnsmasq",
-            &format!("--interface={iface}"),
-            "--bind-interfaces",
-            "--dhcp-range=192.168.173.80,192.168.173.90,255.255.255.0,5m",
-            &format!("--dhcp-option=3,{our_ip}"),
-            &format!("--dhcp-option=6,{our_ip}"),
-            "--no-daemon",
-            "--log-facility=-",
-            "--except-interface=lo",
-            "--no-resolv",
-            "--no-hosts",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    match spawn {
-        Ok(_) => log::info!("DHCP server started on {iface} ({our_ip}/24)"),
-        Err(e) => log::error!("Failed to set up DHCP: {e}"),
-    }
-    our_ip
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

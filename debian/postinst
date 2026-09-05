@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+# Grant the capabilities the native (root-free) networking backend needs:
+#   CAP_NET_ADMIN        — configure the P2P group interface's IP via netlink
+#   CAP_NET_BIND_SERVICE — bind UDP :67 for the in-process DHCP server
+# This lets `MIRACAST_NET=native` run without sudo/root. It is harmless for the
+# default (subprocess) path, which does not use these capabilities. Best-effort:
+# a missing setcap or an unsupported filesystem must not fail the install.
+if [ "$1" = "configure" ]; then
+    if command -v setcap >/dev/null 2>&1; then
+        setcap 'cap_net_admin,cap_net_bind_service+ep' /usr/bin/ubuntu-miracast-server \
+            || echo "ubuntu-miracast-server: setcap failed; native net mode will need sudo" >&2
+    else
+        echo "ubuntu-miracast-server: setcap not found (libcap2-bin); native net mode will need sudo" >&2
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

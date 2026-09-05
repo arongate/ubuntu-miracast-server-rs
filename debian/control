@@ -21,7 +21,8 @@ Depends: ${shlibs:Depends},
          gstreamer1.0-plugins-good,
          gstreamer1.0-plugins-bad,
          wpasupplicant,
-         dnsmasq
+         dnsmasq,
+         libcap2-bin
 Recommends: gstreamer1.0-vaapi
 Description: Miracast server (sink) for Ubuntu
  Ubuntu Miracast Server is a desktop application that acts as a

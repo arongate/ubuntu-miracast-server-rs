@@ -8,6 +8,7 @@ pub mod config;
 pub mod events;
 pub mod history;
 pub mod models;
+pub mod net_backend;
 pub mod p2p_backend;
 pub mod rtsp;
 pub mod sync_ext;

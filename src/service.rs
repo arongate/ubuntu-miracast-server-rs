@@ -312,6 +312,7 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
                                 auto_accept,
                                 connection_timeout,
                                 std::sync::Arc::clone(&backend),
+                                crate::net_backend::select_net_backend(),
                                 tx.clone(),
                             );
                             h.start_listening(group_interface);

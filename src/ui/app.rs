@@ -291,6 +291,7 @@ fn on_advertiser_started(state: &Rc<App>, group_interface: &str) {
         state.auto_accept,
         state.connection_timeout,
         state.advertiser.borrow().backend(),
+        crate::net_backend::select_net_backend(),
         state.event_sender.clone(),
     );
     handler.start_listening(group_interface);

@@ -168,9 +168,27 @@ path:
   handshake has only run on the `wpa_cli` path. One field to confirm on
   hardware: peer MAC is read from `Peer.DeviceAddress`; if named differently,
   `peer_mac_from_signal` logs and skips (non-fatal) rather than connecting.
-- **Phase 3 (pending):** IP + DHCP (`ip`, `dnsmasq`) — still subprocess; the only
-  remaining root requirement. Options in the research doc (NetworkManager shared
-  mode vs `setcap` + native rtnetlink/in-proc DHCP).
+- **Phase 3 (done, feature-gated):** IP + DHCP behind a `NetBackend` trait
+  (`src/net_backend.rs`), runtime-selected like Phase 2:
+  - `subprocess` — the original `sudo ip` + `dnsmasq` path (DEFAULT,
+    hardware-validated), relocated behind the trait.
+  - `native` (feature `native-net`) — interface IP via **netlink** (`neli` 0.7,
+    sync, builder API) needing `CAP_NET_ADMIN`, plus an **in-process DHCP
+    server** (plain `UdpSocket` on :67, `SO_BINDTODEVICE`-pinned to the P2P
+    interface) needing `CAP_NET_BIND_SERVICE`. No NetworkManager, no `ip`/
+    `dnsmasq` binaries — depends only on the Linux kernel, the most portable
+    option across distributions. The DHCP behaviour mirrors the dnsmasq config
+    (pool 192.168.173.80-90, router+DNS = the GO IP, 5m lease) and keeps its own
+    in-memory lease table for peer-IP resolution.
+  Selected via `MIRACAST_NET=native`. `debian/postinst` runs `setcap
+  cap_net_admin,cap_net_bind_service+ep` on the binary (best-effort) so the
+  native path runs with **no runtime root**. Chosen for maximum Linux
+  compatibility over the NetworkManager-shared-mode alternative.
+
+  **Not yet hardware-tested:** the in-process DHCP server is unit-tested
+  (DISCOVER→OFFER in-pool, router/DNS options, pool wrap) and the netlink code
+  compiles against the real neli 0.7.4 builder API, but the live IP-assign +
+  lease exchange has only run on the subprocess (`ip`/`dnsmasq`) path.
 
 ## CI / release
 

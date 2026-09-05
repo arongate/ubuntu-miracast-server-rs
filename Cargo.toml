@@ -20,6 +20,10 @@ default = ["gui"]
 gui = ["dep:gtk4", "dep:libadwaita", "dep:gstgtk4"]
 # Opt-in wpa_supplicant D-Bus P2P backend (else the wpa_cli subprocess backend).
 dbus-backend = []
+# Opt-in root-free networking: native netlink (via neli) for interface IP +
+# an in-process DHCP server, replacing the sudo `ip`/`dnsmasq` subprocess path.
+# Requires the binary to hold CAP_NET_ADMIN + CAP_NET_BIND_SERVICE (setcap).
+native-net = ["dep:neli"]
 
 [dependencies]
 # GStreamer bound in-process (matches PyGObject Gst usage): dynamic pipeline,
@@ -47,6 +51,8 @@ regex = "1.10"
 # D-Bus for systemd --user service control. Uses the blocking API (zbus::blocking),
 # which ships by default alongside the async-io backend — no async runtime needed.
 zbus = "4"
+# Native netlink (sync) for root-free interface IP config (feature = native-net).
+neli = { version = "0.7", optional = true, features = ["sync"] }
 
 # GUI stack (feature = "gui")
 gtk4 = { version = "0.9", optional = true, features = ["v4_10"] }
