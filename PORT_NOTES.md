@@ -185,10 +185,21 @@ path:
   native path runs with **no runtime root**. Chosen for maximum Linux
   compatibility over the NetworkManager-shared-mode alternative.
 
-  **Not yet hardware-tested:** the in-process DHCP server is unit-tested
-  (DISCOVER→OFFER in-pool, router/DNS options, pool wrap) and the netlink code
-  compiles against the real neli 0.7.4 builder API, but the live IP-assign +
-  lease exchange has only run on the subprocess (`ip`/`dnsmasq`) path.
+- **Interface enumeration (Phase 2.5, done):** `list_p2p_interfaces` now queries
+  `fi.w1.wpa_supplicant1`'s `Interfaces` property + each `Ifname` over the system
+  bus (sudo-free, `netdev`-gated), driver from sysfs; it falls back to the legacy
+  sudo `wpa_cli`/`nmcli` enumeration only if the bus is unreachable. The D-Bus
+  backend's `ensure_interface` already resolved interfaces natively, so with this
+  change the **`dbus-backend` + `native-net` runtime path invokes zero `sudo` and
+  needs no root** — the CLI/subprocess backends' sudo sites are compiled but not
+  selected, and `ui/app.rs` skips the dedicated-supplicant bootstrap under D-Bus.
+  Verified live: the `Interfaces` D-Bus query returns results on the test host, so
+  the sudo fallback is not hit.
+
+  **Not yet hardware-tested:** the D-Bus P2P path and the native netlink IP-assign
+  + in-process DHCP compile against verified APIs and pass unit tests, but the
+  live P2P handshake + IP/lease exchange has only run on the subprocess/wpa_cli
+  path.
 
 ## CI / release
 

@@ -180,8 +180,70 @@ pub fn run_wpa_cli(
 
 /// List all available P2P device interfaces on the system.
 ///
-/// Queries both wpa_supplicant and NetworkManager, deduplicating by name.
+/// Tries wpa_supplicant's D-Bus interface first (no sudo, `netdev`-group-gated):
+/// reads the root `Interfaces` property and each object's `Ifname`. Only if the
+/// bus is unreachable or returns nothing does it fall back to the legacy sudo
+/// `wpa_cli` + `nmcli` enumeration — so the D-Bus root-free path shells out to
+/// nothing.
 pub fn list_p2p_interfaces() -> Vec<InterfaceInfo> {
+    let dbus = list_p2p_interfaces_dbus();
+    if !dbus.is_empty() {
+        return dbus;
+    }
+    list_p2p_interfaces_subprocess()
+}
+
+/// Sudo-free enumeration via `fi.w1.wpa_supplicant1` on the system bus.
+/// Returns an empty vec if the bus is unreachable (caller falls back).
+fn list_p2p_interfaces_dbus() -> Vec<InterfaceInfo> {
+    use zbus::blocking::{Connection, Proxy};
+    use zbus::zvariant::OwnedObjectPath;
+
+    let mut out = Vec::new();
+    let conn = match Connection::system() {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let root = match Proxy::new(
+        &conn,
+        "fi.w1.wpa_supplicant1",
+        "/fi/w1/wpa_supplicant1",
+        "fi.w1.wpa_supplicant1",
+    ) {
+        Ok(p) => p,
+        Err(_) => return out,
+    };
+    let ifaces: Vec<OwnedObjectPath> = match root.get_property("Interfaces") {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for obj in ifaces {
+        let p = match Proxy::new(
+            &conn,
+            "fi.w1.wpa_supplicant1".to_string(),
+            obj.as_str().to_string(),
+            "fi.w1.wpa_supplicant1.Interface".to_string(),
+        ) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Ok(name) = p.get_property::<String>("Ifname") {
+            // Driver from sysfs (sudo-free); status is best-effort "available"
+            // (the P2P-capability status probe would itself need sudo/nmcli).
+            let driver = read_interface_driver(&name);
+            out.push(InterfaceInfo {
+                interface: name.clone(),
+                parent: name,
+                driver,
+                status: "available".to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// Legacy enumeration via sudo `wpa_cli` + `nmcli`. Fallback only.
+fn list_p2p_interfaces_subprocess() -> Vec<InterfaceInfo> {
     let mut interfaces = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
