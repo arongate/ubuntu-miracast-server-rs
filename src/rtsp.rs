@@ -351,6 +351,30 @@ impl Default for WfdVideoFormat {
 }
 
 impl WfdVideoFormat {
+    /// Build a video-format capability for a target MAX resolution. The band /
+    /// bandwidth decision lives in `capabilities`; this maps the chosen ceiling
+    /// to the WFD native mode + CEA bitmap the source reads. 1080p advertises
+    /// native 1920x1080@30p (CEA idx 7 -> 0x38) with a bitmap including 1080p60;
+    /// 720p advertises native 1280x720@30p (CEA idx 5 -> 0x28) with a bitmap
+    /// capped so the source cannot pick 1080p (which a 2.4GHz link can't carry).
+    /// Anything else falls back to the 720p-safe profile.
+    pub fn for_max_resolution(max_w: u32, max_h: u32) -> Self {
+        let (native_index, cea_bitmap) = if max_w >= 1920 || max_h >= 1080 {
+            // native = CEA idx 7 (1080p30) << 3 = 0x38; bitmap = std + 1080p60.
+            (0x38, 0x0001DFFF)
+        } else {
+            // 720p ceiling: native = CEA idx 5 (720p30) << 3 = 0x28; bitmap keeps
+            // only up-to-720p bits (0..6, i.e. 0x0000007F) so 1080p is not
+            // offered — the source then tops out at 720p, which fits 2.4GHz.
+            (0x28, 0x0000_007F)
+        };
+        Self {
+            native_index,
+            cea_bitmap,
+            ..Self::default()
+        }
+    }
+
     /// Serialize to WFD response format (matches Python `to_wfd_string`).
     pub fn to_wfd_string(&self) -> String {
         format!(
@@ -625,6 +649,26 @@ mod tests {
             "Public: org.wfa.wfd1.0, GET_PARAMETER, SET_PARAMETER, SETUP, PLAY, TEARDOWN"
         ));
         assert!(wire.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn for_max_resolution_1080p_and_720p_profiles() {
+        // 1080p: native 0x38 (1080p30) + bitmap incl. 1080p60.
+        let hd = WfdVideoFormat::for_max_resolution(1920, 1080);
+        assert_eq!(hd.native_index, 0x38);
+        assert_eq!(hd.cea_bitmap, 0x0001DFFF);
+        // 720p: native 0x28 (720p30) + bitmap capped to ≤720p (no 1080p bits).
+        let sd = WfdVideoFormat::for_max_resolution(1280, 720);
+        assert_eq!(sd.native_index, 0x28);
+        assert_eq!(sd.cea_bitmap, 0x0000_007F);
+        // The 720p bitmap must NOT include any 1080p bit (7,8,9,12,13,14,16).
+        for bit in [7u32, 8, 9, 12, 13, 14, 16] {
+            assert_eq!(
+                sd.cea_bitmap & (1 << bit),
+                0,
+                "720p offered 1080p bit {bit}"
+            );
+        }
     }
 
     #[test]

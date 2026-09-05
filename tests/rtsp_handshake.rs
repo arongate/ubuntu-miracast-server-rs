@@ -200,7 +200,7 @@ fn rtsp_m1_to_m7_handshake_reaches_stream_started() {
 
     let (tx, rx) = channel();
     // rtsp_port = mock port; headless=true → fakesink (no display needed).
-    let mut receiver = MiracastReceiver::new(port, 1028, true, false, tx);
+    let mut receiver = MiracastReceiver::new(port, 1028, true, false, tx, (1920, 1080));
 
     let conn = IncomingConnection::try_new(
         "00:11:22:33:44:55",

@@ -55,6 +55,9 @@ pub struct WpaCliBackend {
     ctrl_path: Option<String>,
     /// Resolved P2P device interface (set on first `ensure_interface`).
     p2p_interface: std::sync::Mutex<Option<String>>,
+    /// GO operating frequency in MHz (capability-detected). 0 = let the driver
+    /// choose (no `freq=` arg).
+    go_freq_mhz: u32,
 }
 
 impl WpaCliBackend {
@@ -62,7 +65,14 @@ impl WpaCliBackend {
         Self {
             ctrl_path,
             p2p_interface: std::sync::Mutex::new(None),
+            go_freq_mhz: 0,
         }
+    }
+
+    /// Seed the capability-detected GO operating frequency (MHz).
+    pub fn with_go_freq(mut self, mhz: u32) -> Self {
+        self.go_freq_mhz = mhz;
+        self
     }
 
     /// Optionally seed the P2P interface (from config / CLI flag).
@@ -140,23 +150,46 @@ impl P2pBackend for WpaCliBackend {
             log::debug!("Pre-existing P2P group interfaces: {pre_existing:?}");
         }
 
-        // Create the autonomous GO on a 2.4GHz SOCIAL channel (freq=2412 = ch1).
-        // Android/Miracast device discovery only probes the social channels
-        // (1/6/11, 2.4GHz); a GO that lands on 5GHz (or gets auto-steered there)
-        // beacons where the phone never scans and is invisible to Cast. freq=
-        // is the reliable channel force on wpa_supplicant 2.10.
-        let result = self.wpa(&["p2p_group_add", "persistent", "freq=2412"], None, false)?;
-        if result.contains("FAIL") {
-            // Retry without the freq pin: on a single-radio adapter already on a
-            // 5GHz STA channel the SCC constraint can reject freq=2412. The
-            // dedicated-supplicant path (idle adapter) should accept it.
-            log::warn!("p2p_group_add with freq=2412 failed ({result}); retrying without freq");
-            let retry = self.wpa(&["p2p_group_add", "persistent"], None, false)?;
-            if retry.contains("FAIL") {
-                return Err(super::BackendError::Runtime(format!(
-                    "p2p_group_add failed: {retry}"
-                )));
+        // Create the autonomous GO on the capability-detected operating channel
+        // (best clean 5GHz channel when the radio allows it → full bandwidth;
+        // else a 2.4GHz social channel). Discovery still works because the
+        // device stays in P2P Listen via extended-listen below. Fallback chain
+        // keeps the GO coming up even if the preferred freq is rejected.
+        let mut freq_attempts: Vec<String> = Vec::new();
+        if self.go_freq_mhz > 0 {
+            freq_attempts.push(format!("freq={}", self.go_freq_mhz));
+        }
+        freq_attempts.push("freq=2412".to_string()); // 2.4GHz social ch1 fallback
+        freq_attempts.push(String::new()); // last resort: let the driver choose
+
+        let mut created = false;
+        for (i, freq) in freq_attempts.iter().enumerate() {
+            let args: Vec<&str> = if freq.is_empty() {
+                vec!["p2p_group_add", "persistent"]
+            } else {
+                vec!["p2p_group_add", "persistent", freq.as_str()]
+            };
+            let result = self.wpa(&args, None, false)?;
+            if !result.contains("FAIL") {
+                if i > 0 {
+                    log::warn!(
+                        "p2p_group_add fell back to '{}' (preferred freq rejected)",
+                        if freq.is_empty() {
+                            "driver-chosen"
+                        } else {
+                            freq
+                        }
+                    );
+                }
+                created = true;
+                break;
             }
+            log::warn!("p2p_group_add '{freq}' failed ({result}); trying next");
+        }
+        if !created {
+            return Err(super::BackendError::Runtime(
+                "p2p_group_add failed on all frequency attempts".to_string(),
+            ));
         }
         log::info!("p2p_group_add issued, waiting for group interface...");
 

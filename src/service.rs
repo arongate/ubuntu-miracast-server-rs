@@ -267,8 +267,12 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
     );
 
     let (tx, rx) = channel();
+    // Detect physical config → optimal parameters (GO channel, resolution, etc.).
+    let caps = crate::capabilities::detect(crate::receiver::audio_sink_available);
+    log::info!("CapabilityReport: {}", caps.report());
+
     // Service mode uses the system wpa_supplicant (no dedicated ctrl path).
-    let backend = crate::p2p_backend::select_backend(None, iface.clone());
+    let backend = crate::p2p_backend::select_backend(None, iface.clone(), caps.go_freq_mhz);
     let mut advertiser = MiracastAdvertiser::new(
         name.clone(),
         rtsp_port,
@@ -276,7 +280,14 @@ pub fn run_as_service(device_name: Option<String>, p2p_interface: Option<String>
         std::sync::Arc::clone(&backend),
         tx.clone(),
     );
-    let mut receiver = MiracastReceiver::new(rtsp_port, rtp_port, true, audio_enabled, tx.clone());
+    let mut receiver = MiracastReceiver::new(
+        rtsp_port,
+        rtp_port,
+        true,
+        audio_enabled,
+        tx.clone(),
+        caps.max_resolution,
+    );
     let mut handler: Option<ConnectionHandler> = None;
 
     // SIGINT/SIGTERM → set the shutdown flag drained by the loop.

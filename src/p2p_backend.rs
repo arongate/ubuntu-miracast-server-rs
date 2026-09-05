@@ -122,6 +122,7 @@ pub mod dbus;
 pub fn select_backend(
     ctrl_path: Option<String>,
     iface: Option<String>,
+    go_freq_mhz: u32,
 ) -> std::sync::Arc<dyn P2pBackend> {
     #[cfg(feature = "dbus-backend")]
     {
@@ -141,5 +142,9 @@ pub fn select_backend(
         }
     }
     log::info!("P2P backend: wpa_cli (subprocess)");
-    std::sync::Arc::new(cli::WpaCliBackend::new(ctrl_path).with_interface(iface))
+    std::sync::Arc::new(
+        cli::WpaCliBackend::new(ctrl_path)
+            .with_interface(iface)
+            .with_go_freq(go_freq_mhz),
+    )
 }

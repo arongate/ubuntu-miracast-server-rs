@@ -4,6 +4,7 @@
 //! The headless core builds with `--no-default-features`; the GTK4 + libadwaita
 //! GUI is gated behind the `gui` feature.
 
+pub mod capabilities;
 pub mod config;
 pub mod events;
 pub mod history;

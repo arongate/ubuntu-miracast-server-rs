@@ -394,6 +394,31 @@ fn set_if_has(el: &gst::Element, name: &str, value: impl Into<gst::glib::Value>)
     }
 }
 
+/// Fast, up-front probe: can ANY audio sink actually open on this host/run
+/// context? pulsesink connects to PulseAudio at the READY transition, which
+/// fails ("Connection refused") when there is no user PA session (e.g. under
+/// sudo). Test it cheaply — bring a standalone sink to READY with a short wait —
+/// so the pipeline is built audio-on ONLY when audio can work, avoiding a failed
+/// PLAYING attempt that would delay the RTSP M7 response.
+pub(crate) fn audio_sink_available() -> bool {
+    for factory in ["pulsesink", "autoaudiosink"] {
+        let Ok(sink) = gst::ElementFactory::make(factory).build() else {
+            continue;
+        };
+        if sink.set_state(gst::State::Ready).is_ok() {
+            let settled = sink.state(gst::ClockTime::from_seconds(2)).0.is_ok();
+            let _ = sink.set_state(gst::State::Null);
+            if settled {
+                log::debug!("Audio sink available: {factory}");
+                return true;
+            }
+        } else {
+            let _ = sink.set_state(gst::State::Null);
+        }
+    }
+    false
+}
+
 /// Shared, thread-safe receiver state (counters updated from probe + threads).
 struct RxState {
     running: AtomicBool,
@@ -433,6 +458,7 @@ pub struct MiracastReceiver {
     headless: bool,
     audio_enabled: bool,
     events: EventSender,
+    max_resolution: (u32, u32),
 
     state: Arc<RxState>,
     pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
@@ -455,6 +481,7 @@ impl MiracastReceiver {
         headless: bool,
         audio_enabled: bool,
         events: EventSender,
+        max_resolution: (u32, u32),
     ) -> Self {
         gst_init();
         Self {
@@ -463,6 +490,7 @@ impl MiracastReceiver {
             headless,
             audio_enabled,
             events,
+            max_resolution,
             state: Arc::new(RxState::new()),
             pipeline: Arc::new(Mutex::new(None)),
             epoch: Instant::now(),
@@ -518,6 +546,7 @@ impl MiracastReceiver {
             headless: self.headless,
             audio_enabled: self.audio_enabled,
             events: self.events.clone(),
+            max_resolution: self.max_resolution,
             state: Arc::clone(&self.state),
             pipeline: Arc::clone(&self.pipeline),
             epoch: self.epoch,
@@ -603,6 +632,7 @@ struct SessionCtx {
     headless: bool,
     audio_enabled: bool,
     events: EventSender,
+    max_resolution: (u32, u32),
     state: Arc<RxState>,
     pipeline: Arc<Mutex<Option<gst::Pipeline>>>,
     epoch: Instant,
@@ -851,7 +881,9 @@ impl SessionCtx {
         let mut msg =
             format!("wfd_client_rtp_ports: RTP/AVP/UDP;unicast {rtp_port} 0 mode=play\r\n");
         msg.push_str("wfd_audio_codecs: AAC 00000001 00\r\n");
-        msg.push_str("wfd_video_formats: 00 00 02 10 0001FEFF 3FFFFFFF 00000FFF 00 0000 0000 00 none none\r\n");
+        let (mw, mh) = self.max_resolution;
+        let vfmt = crate::rtsp::WfdVideoFormat::for_max_resolution(mw, mh).to_wfd_string();
+        msg.push_str(&format!("wfd_video_formats: {vfmt}\r\n"));
         msg.push_str("wfd_3d_video_formats: none\r\n");
         msg.push_str("wfd_coupled_sink: none\r\n");
         msg.push_str("wfd_connector_type: 05\r\n");
@@ -897,25 +929,8 @@ impl SessionCtx {
     /// sudo). We test that cheaply — set a standalone sink to READY with a short
     /// wait — so the real pipeline is built audio-on ONLY when audio can work,
     /// avoiding a failed PLAYING attempt that would delay the RTSP M7 response.
-    fn audio_sink_available() -> bool {
-        for factory in ["pulsesink", "autoaudiosink"] {
-            let Ok(sink) = gst::ElementFactory::make(factory).build() else {
-                continue;
-            };
-            // READY is where pulsesink opens the device/connects to PA.
-            if sink.set_state(gst::State::Ready).is_ok() {
-                // Confirm it actually settled into READY (async sinks).
-                let settled = sink.state(gst::ClockTime::from_seconds(2)).0.is_ok();
-                let _ = sink.set_state(gst::State::Null);
-                if settled {
-                    log::debug!("Audio sink available: {factory}");
-                    return true;
-                }
-            } else {
-                let _ = sink.set_state(gst::State::Null);
-            }
-        }
-        false
+    pub(crate) fn audio_sink_available() -> bool {
+        audio_sink_available()
     }
 
     /// Build and start the GStreamer pipeline, wiring bus + probe + stats.
@@ -1356,6 +1371,7 @@ mod tests {
             headless: true,
             audio_enabled: true,
             events: tx,
+            max_resolution: (1920, 1080),
             state: Arc::new(RxState::new()),
             pipeline: Arc::new(Mutex::new(None)),
             epoch: Instant::now(),
@@ -1367,7 +1383,10 @@ mod tests {
         let body = ctx.build_capability_body("");
         assert!(body.contains("wfd_client_rtp_ports: RTP/AVP/UDP;unicast 1028 0 mode=play\r\n"));
         assert!(body.contains("wfd_audio_codecs: AAC 00000001 00\r\n"));
-        assert!(body.contains("wfd_video_formats: 00 00 02 10 0001FEFF 3FFFFFFF 00000FFF 00 0000 0000 00 none none\r\n"));
+        // Now capability-driven: max_resolution (1920,1080) → 1080p native+bitmap.
+        assert!(body.contains(
+            "wfd_video_formats: 38 00 02 10 0001DFFF 00000000 00000000 00 0000 0000 00 none none\r\n"
+        ));
         assert!(body.contains("wfd_connector_type: 05\r\n"));
         // IDR only appears when the source queried for it.
         assert!(!body.contains("wfd_idr_request_capability"));

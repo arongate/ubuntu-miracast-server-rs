@@ -122,15 +122,22 @@ fn activate(
 
     let (tx, rx) = channel();
 
+    // Detect the machine's physical config once and derive the optimal runtime
+    // parameters (best GO channel/band, resolution-per-band, HW decode, audio).
+    let caps = crate::capabilities::detect(crate::receiver::audio_sink_available);
+    log::info!("CapabilityReport: {}", caps.report());
+
     // One P2P backend (wpa_cli by default; wpa_supplicant D-Bus when selected),
     // shared by the advertiser and the connection handler. Seed it with the
     // dedicated supplicant's interface (falling back to the configured one) so
-    // it drives that instance's control socket, not the system supplicant's.
+    // it drives that instance's control socket, not the system supplicant's,
+    // and with the capability-detected GO operating frequency.
     let backend = crate::p2p_backend::select_backend(
         ctrl_path.clone(),
         effective_interface
             .clone()
             .or_else(|| p2p_interface.clone()),
+        caps.go_freq_mhz,
     );
 
     let advertiser = Rc::new(RefCell::new(MiracastAdvertiser::new(
@@ -148,6 +155,7 @@ fn activate(
         false,
         audio_enabled,
         tx.clone(),
+        caps.max_resolution,
     )));
 
     // Build views + window.
