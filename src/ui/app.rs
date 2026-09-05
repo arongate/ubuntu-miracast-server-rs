@@ -422,9 +422,9 @@ fn start_dedicated_supplicant(
     device_name: &str,
 ) -> Option<P2PSupplicantManager> {
     use crate::utils::list_p2p_interfaces;
-    use std::process::Command;
 
-    // Find a suitable adapter: disconnected from router, P2P-capable.
+    // Find a suitable adapter: P2P-capable AND not carrying the internet
+    // connection. An explicit config/CLI interface wins outright.
     let target_iface: Option<String> = if let Some(p2p) = p2p_interface {
         Some(
             p2p.strip_prefix("p2p-dev-")
@@ -432,13 +432,33 @@ fn start_dedicated_supplicant(
                 .unwrap_or_else(|| p2p.clone()),
         )
     } else {
-        list_p2p_interfaces()
+        // Auto-select. list_p2p_interfaces()'s D-Bus path reports every iface as
+        // "available" (a real status probe needs sudo), so status alone can't
+        // tell the active Wi-Fi uplink from an idle adapter — and its ordering
+        // is not stable (it flipped wlx→wlo1 between runs). So probe each
+        // candidate for wpa_state=COMPLETED (an active STA connection) and pick
+        // the FIRST idle one, skipping the uplink instead of grabbing it and
+        // failing p2p_group_add. Candidates already "connected" per the list are
+        // skipped cheaply first.
+        let candidates: Vec<String> = list_p2p_interfaces()
             .into_iter()
-            .find(|i| i.status != "connected")
-            .map(|i| {
-                log::info!("Auto-selected {} for dedicated P2P supplicant", i.parent);
-                i.parent
-            })
+            .filter(|i| i.status != "connected")
+            .map(|i| i.parent)
+            .collect();
+        let pick = candidates
+            .iter()
+            .find(|iface| !adapter_on_wifi(iface))
+            .cloned();
+        if let Some(ref p) = pick {
+            log::info!("Auto-selected {p} for dedicated P2P supplicant");
+        } else if !candidates.is_empty() {
+            log::info!(
+                "All P2P-capable adapters ({}) are carrying a Wi-Fi connection; \
+                 using system wpa_supplicant",
+                candidates.join(", ")
+            );
+        }
+        pick
     };
 
     let target_iface = match target_iface {
@@ -449,19 +469,12 @@ fn start_dedicated_supplicant(
         }
     };
 
-    // Don't start a dedicated instance on an adapter already used for internet.
-    if let Ok(out) = Command::new("sudo")
-        .args(["wpa_cli", "-i", &target_iface, "status"])
-        .output()
-    {
-        if out.status.success()
-            && String::from_utf8_lossy(&out.stdout).contains("wpa_state=COMPLETED")
-        {
-            log::info!(
-                "Adapter {target_iface} is connected to Wi-Fi — not starting dedicated supplicant"
-            );
-            return None;
-        }
+    // Guard the explicit-interface path too (auto-select already filtered).
+    if adapter_on_wifi(&target_iface) {
+        log::info!(
+            "Adapter {target_iface} is connected to Wi-Fi — not starting dedicated supplicant"
+        );
+        return None;
     }
 
     let mut mgr = P2PSupplicantManager::new(target_iface.clone(), device_name);
@@ -475,6 +488,23 @@ fn start_dedicated_supplicant(
             None
         }
     }
+}
+
+/// True if `iface` is currently carrying an associated Wi-Fi (STA) connection,
+/// i.e. it is the internet uplink and must NOT be repurposed as a dedicated P2P
+/// GO. Probes the system wpa_supplicant for `wpa_state=COMPLETED`. Best-effort:
+/// a probe that cannot run (no supplicant control on this iface) reads as "not
+/// on Wi-Fi", which is the safe default for an idle adapter.
+fn adapter_on_wifi(iface: &str) -> bool {
+    use std::process::Command;
+    Command::new("sudo")
+        .args(["wpa_cli", "-i", iface, "status"])
+        .output()
+        .map(|out| {
+            out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("wpa_state=COMPLETED")
+        })
+        .unwrap_or(false)
 }
 
 /// Orderly shutdown: Receiver → ConnectionHandler → Advertiser → Supplicant.
