@@ -126,11 +126,23 @@ impl P2pBackend for WpaCliBackend {
         self.wpa(&["p2p_find", "type=progressive"], None, true)?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
-        let result = self.wpa(&["p2p_group_add", "persistent"], None, false)?;
+        // Create the autonomous GO on a 2.4GHz SOCIAL channel (freq=2412 = ch1).
+        // Android/Miracast device discovery only probes the social channels
+        // (1/6/11, 2.4GHz); a GO that lands on 5GHz (or gets auto-steered there)
+        // beacons where the phone never scans and is invisible to Cast. freq=
+        // is the reliable channel force on wpa_supplicant 2.10.
+        let result = self.wpa(&["p2p_group_add", "persistent", "freq=2412"], None, false)?;
         if result.contains("FAIL") {
-            return Err(super::BackendError::Runtime(format!(
-                "p2p_group_add failed: {result}"
-            )));
+            // Retry without the freq pin: on a single-radio adapter already on a
+            // 5GHz STA channel the SCC constraint can reject freq=2412. The
+            // dedicated-supplicant path (idle adapter) should accept it.
+            log::warn!("p2p_group_add with freq=2412 failed ({result}); retrying without freq");
+            let retry = self.wpa(&["p2p_group_add", "persistent"], None, false)?;
+            if retry.contains("FAIL") {
+                return Err(super::BackendError::Runtime(format!(
+                    "p2p_group_add failed: {retry}"
+                )));
+            }
         }
         log::info!("p2p_group_add issued, waiting for group interface...");
 
@@ -151,6 +163,23 @@ impl P2pBackend for WpaCliBackend {
         ) {
             log::debug!("Could not set WFD on group iface (may not be needed): {e}");
         }
+
+        // CRITICAL for discovery: an autonomous GO only BEACONS — it does not by
+        // itself stay in P2P Listen state. Android finds a sink via P2P device
+        // discovery (Probe Request/Response on the social channels) filtered by
+        // the WFD IE, NOT by reading the beacon. So keep the device discoverable
+        // while the GO runs: Extended Listen Timing makes it periodically enter
+        // Listen state and answer probes (avail 200ms every 500ms), and a fresh
+        // p2p_find keeps the P2P state machine advertising. Without this the GO
+        // shows up as a Wi-Fi network but never in the phone's Cast list.
+        //   p2p_ext_listen <availability_ms> <interval_ms>
+        if let Err(e) = self.wpa(&["p2p_ext_listen", "200", "500"], None, false) {
+            log::warn!("Could not enable extended listen ({e}); discovery may be unreliable");
+        }
+        if let Err(e) = self.wpa(&["p2p_find", "type=progressive"], None, true) {
+            log::debug!("Post-group p2p_find returned: {e}");
+        }
+        log::info!("Extended-listen discovery active on {group_iface}");
 
         Ok(group_iface)
     }

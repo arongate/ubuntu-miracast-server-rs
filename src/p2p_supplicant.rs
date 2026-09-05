@@ -18,6 +18,10 @@ update_config=1
 device_name={device_name}
 device_type=7-0050F204-1
 p2p_go_intent=1
+p2p_listen_reg_class=81
+p2p_listen_channel=1
+p2p_oper_reg_class=81
+p2p_oper_channel=1
 driver_param=p2p_device=1
 country=FR
 ";
@@ -240,6 +244,24 @@ impl P2PSupplicantManager {
             ),
             Err(e) => log::debug!("Could not unmanage from NM: {e}"),
         }
+        // Bring the interface UP. NM leaves an unmanaged adapter DOWN, and a
+        // prior run's teardown can leave it down/unmanaged — wpa_supplicant
+        // cannot start P2P on a down link, so self-heal it here rather than
+        // depending on the adapter's state from the last run.
+        match run_brief(
+            Command::new("sudo").args(["ip", "link", "set", &self.interface, "up"]),
+            Duration::from_secs(5),
+        ) {
+            Ok(out) if out.status.success() => {
+                log::debug!("Brought {} up for dedicated supplicant", self.interface);
+            }
+            Ok(out) => log::debug!(
+                "ip link set up returned {}: {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => log::debug!("Could not bring {} up: {e}", self.interface),
+        }
     }
 
     fn remanage_with_nm(&mut self) {
@@ -390,6 +412,10 @@ mod tests {
                         device_name=Ubuntu Miracast Server\n\
                         device_type=7-0050F204-1\n\
                         p2p_go_intent=1\n\
+                        p2p_listen_reg_class=81\n\
+                        p2p_listen_channel=1\n\
+                        p2p_oper_reg_class=81\n\
+                        p2p_oper_channel=1\n\
                         driver_param=p2p_device=1\n\
                         country=FR\n";
         assert_eq!(content, expected);
