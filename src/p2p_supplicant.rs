@@ -263,23 +263,21 @@ impl P2PSupplicantManager {
             .replace("{device_name}", &self.device_name);
 
         // Remove stale file from a previous run (may be root-owned).
-        if Path::new(&self.conf_path).exists() {
-            if std::fs::remove_file(&self.conf_path).is_err() {
+        if Path::new(&self.conf_path).exists()
+            && std::fs::remove_file(&self.conf_path).is_err() {
                 let _ = run_brief(
                     Command::new("sudo").args(["rm", "-f", &self.conf_path]),
                     Duration::from_secs(5),
                 );
             }
-        }
         // Clean stale control socket directory.
-        if Path::new(&self.ctrl_dir).exists() {
-            if std::fs::remove_dir_all(&self.ctrl_dir).is_err() {
+        if Path::new(&self.ctrl_dir).exists()
+            && std::fs::remove_dir_all(&self.ctrl_dir).is_err() {
                 let _ = run_brief(
                     Command::new("sudo").args(["rm", "-rf", &self.ctrl_dir]),
                     Duration::from_secs(5),
                 );
             }
-        }
 
         std::fs::write(&self.conf_path, content)
             .map_err(|e| SupplicantError(format!("Failed to write wpa_supplicant config: {e}")))?;

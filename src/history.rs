@@ -132,7 +132,7 @@ impl ServerSessionHistory {
     /// Get all records sorted by timestamp descending (most recent first).
     pub fn get_sessions(&self) -> Vec<ServerSessionRecord> {
         let mut out = self.sessions.clone();
-        out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        out.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
         out
     }
 

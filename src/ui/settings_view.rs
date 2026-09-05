@@ -21,6 +21,7 @@ use crate::config::ServerConfig;
 use crate::utils::list_p2p_interfaces;
 
 type Config = Rc<RefCell<ServerConfig>>;
+type InterfaceHook = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
 pub struct SettingsView {
     root: gtk::ScrolledWindow,
@@ -28,7 +29,7 @@ pub struct SettingsView {
     interface_row: adw::ComboRow,
     interface_list: gtk::StringList,
     interface_values: Rc<RefCell<Vec<String>>>,
-    on_switch_interface: Rc<RefCell<Option<Box<dyn Fn(String)>>>>,
+    on_switch_interface: InterfaceHook,
 }
 
 impl SettingsView {

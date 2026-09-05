@@ -172,7 +172,7 @@ impl ServerConfig {
     }
 
     /// Get a configuration value, or `default` if the key is absent.
-    pub fn get<'a>(&'a self, section: &str, key: &str, default: Value) -> Value {
+    pub fn get(&self, section: &str, key: &str, default: Value) -> Value {
         self.config
             .get(section)
             .and_then(|s| s.get(key))
@@ -264,7 +264,7 @@ pub(crate) fn write_json_0600(path: &Path, value: &Value) -> std::io::Result<()>
     let tmp_path = path.with_extension("tmp");
 
     let serialized = serde_json::to_string_pretty(value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     let write_result = (|| -> std::io::Result<()> {
         use std::io::Write;
