@@ -200,10 +200,7 @@ impl PipelineBuilder {
                 .name("audioconvert")
                 .build()
                 .ok();
-            let mut audiosink = gst::ElementFactory::make("pulsesink")
-                .name("audiosink")
-                .build()
-                .ok();
+            let mut audiosink = self.make_audio_sink();
 
             if aacparse.is_none()
                 || audiodec.is_none()
@@ -330,6 +327,45 @@ impl PipelineBuilder {
         Ok(dec)
     }
 
+    /// Build the audio sink (pulsesink). When running as ROOT via `sudo`, root
+    /// has no PulseAudio session of its own, so a bare pulsesink fails to
+    /// connect ("Connection refused"). But the invoking user (`$SUDO_USER`) does
+    /// have a PA daemon at `/run/user/<uid>/pulse/native` — point pulsesink's
+    /// `server` there so audio plays under sudo too. When not root, leave
+    /// `server` unset (connects to the caller's own session normally).
+    fn make_audio_sink(&self) -> Option<gst::Element> {
+        let sink = gst::ElementFactory::make("pulsesink")
+            .name("audiosink")
+            .build()
+            .ok()?;
+        // `SUDO_USER` is set exactly when we were launched via sudo, i.e. we are
+        // root but a real user session exists. Route pulsesink to that user's PA
+        // socket so audio plays under sudo. When not set, leave `server` unset
+        // (connects to the caller's own session normally).
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if let Some(uid) = uid_of_user(&sudo_user) {
+                let server = format!("/run/user/{uid}/pulse/native");
+                if std::path::Path::new(&server).exists() {
+                    sink.set_property("server", &server);
+                    // PA may require the user's cookie to accept a cross-uid
+                    // (root→user) connection; point PULSE_COOKIE at it so the
+                    // connection authenticates. Best-effort.
+                    let cookie = format!("/run/user/{uid}/pulse/cookie");
+                    if std::path::Path::new(&cookie).exists() {
+                        std::env::set_var("PULSE_COOKIE", &cookie);
+                    }
+                    log::info!("Audio: routing pulsesink to {sudo_user}'s PulseAudio ({server})");
+                } else {
+                    log::warn!(
+                        "Audio: {sudo_user}'s PulseAudio socket {server} not found; \
+                         audio may fail under sudo (run non-root for reliable audio)"
+                    );
+                }
+            }
+        }
+        Some(sink)
+    }
+
     /// Create the video sink element based on mode.
     fn make_video_sink(&self) -> Result<gst::Element, String> {
         if self.headless {
@@ -394,6 +430,20 @@ fn set_if_has(el: &gst::Element, name: &str, value: impl Into<gst::glib::Value>)
     }
 }
 
+/// Resolve a username to its numeric uid by parsing `/etc/passwd`
+/// (dependency-free). Locates the invoking user's PulseAudio socket
+/// (`/run/user/<uid>/pulse/native`) when running under sudo.
+fn uid_of_user(user: &str) -> Option<u32> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        if f.next() == Some(user) {
+            return f.nth(1).and_then(|uid| uid.parse::<u32>().ok());
+        }
+    }
+    None
+}
+
 /// Fast, up-front probe: can ANY audio sink actually open on this host/run
 /// context? pulsesink connects to PulseAudio at the READY transition, which
 /// fails ("Connection refused") when there is no user PA session (e.g. under
@@ -401,10 +451,24 @@ fn set_if_has(el: &gst::Element, name: &str, value: impl Into<gst::glib::Value>)
 /// so the pipeline is built audio-on ONLY when audio can work, avoiding a failed
 /// PLAYING attempt that would delay the RTSP M7 response.
 pub(crate) fn audio_sink_available() -> bool {
+    // Under sudo, route the probe's pulsesink at the invoking user's PA socket
+    // (same as make_audio_sink) so the probe reflects the sink the pipeline
+    // will actually use, not a session-less pulsesink that always fails.
+    let sudo_server = std::env::var("SUDO_USER")
+        .ok()
+        .and_then(|u| uid_of_user(&u))
+        .map(|uid| format!("/run/user/{uid}/pulse/native"))
+        .filter(|p| std::path::Path::new(p).exists());
+
     for factory in ["pulsesink", "autoaudiosink"] {
         let Ok(sink) = gst::ElementFactory::make(factory).build() else {
             continue;
         };
+        if factory == "pulsesink" {
+            if let Some(ref server) = sudo_server {
+                sink.set_property("server", server);
+            }
+        }
         if sink.set_state(gst::State::Ready).is_ok() {
             let settled = sink.state(gst::ClockTime::from_seconds(2)).0.is_ok();
             let _ = sink.set_state(gst::State::Null);
