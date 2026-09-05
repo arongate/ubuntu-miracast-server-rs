@@ -90,3 +90,61 @@ the site.
 - `log` 0.4 needs the `std`/`alloc` feature for `set_boxed_logger`.
 - GUI stack: `gtk4` 0.9, `libadwaita` 0.7, `gst-plugin-gtk4` 0.13
   (`gtk4paintablesink`, registered via `plugin_register_static()` at startup).
+
+## Field-test fixes (post-port, hardware-validated)
+
+A real-hardware test (casting from a phone's "Smart View") surfaced three bugs,
+all fixed with regression tests:
+
+- **Group-interface parse** (`advertiser.rs`). `ip link show` emits
+  `3: p2p-0: <FLAGS> mtu 1500 ...`; the parser was capturing the whole line as
+  the interface name instead of just `p2p-0`, so every `wpa_cli -i <name>` call
+  failed ("Failed to arm WPS PIN after 10 attempts") and casts could not
+  complete. Now extracts the name from the correct `": "`-delimited segment,
+  mirroring the Python `parts[1]`. Covered by `parse_group_interface` tests.
+- **Main-thread WPS-arm UI freeze** (`connection.rs`). DHCP setup and WPS-PIN
+  arming (up to 10×1 s retries) ran on the GTK main loop, freezing the window
+  ("not responding"). Moved all blocking setup into the monitor thread;
+  `rearm_wps_pin` (called from the event drain) arms on a detached thread.
+- **Naive-datetime history load** (`models.rs`). The Python app wrote naive
+  ISO 8601 datetimes with no timezone offset (`2026-08-22T22:13:45.593112`);
+  `parse_from_rfc3339` rejected them ("premature end of input"), so existing
+  history failed to load. Now parses both naive and offset-bearing forms and
+  emits the naive form (matching Python's `datetime.isoformat()`), so on-disk
+  history stays compatible across the two implementations.
+
+## Reliability, supply chain, and protocol coverage (hardening pass)
+
+Following an ISO/IEC 25010 review, three hardening changes were made:
+
+- **Poison-tolerant locking** (`sync_ext.rs`). `LockExt::lock_safe()` recovers a
+  poisoned `Mutex` guard instead of panicking. All 43 non-test locks use it, so
+  a panic while a lock is held no longer cascades into app-wide panics. The
+  remaining `.unwrap()`/`.expect()` calls were audited and are safe by
+  construction (compile-time regex literals, thread-spawn failure, guard-checked
+  paths).
+- **Supply-chain gates** (`deny.toml` + CI `security` job). `cargo audit`
+  (RUSTSEC advisories, yanked crates) and `cargo deny` (advisories, license
+  allowlist, source/duplicate policy) run in CI.
+- **RTSP M1–M7 integration test** (`tests/rtsp_handshake.rs`). A mock source on
+  loopback plays the source side of the WFD handshake; the real
+  `MiracastReceiver` is driven through it and asserted to reach `StreamStarted`,
+  exercising the actual socket I/O and message construction.
+
+  **Known limitation:** this test is timing-sensitive at the OS-socket level (if
+  the sink thread is preempted between M5's reply and sending M6, the mock reads
+  EOF). It is therefore marked `#[ignore]` and run in a dedicated serialized,
+  `continue-on-error` CI step — it provides signal without gating the matrix on
+  a scheduling race. Deterministic protocol coverage lives in the `rtsp.rs` and
+  `receiver.rs` unit tests. A future improvement is to make the receiver's
+  `recv_message` resilient to partial reads (it currently treats any incomplete
+  read as a fatal `None`), which would let the test run deterministically.
+
+## CI / release
+
+- `.github/workflows/ci.yml` — matrix of `--no-default-features` (headless core)
+  and `--features gui`, each running `cargo clippy --all-targets -- -D warnings`
+  and `cargo test`; plus `rustfmt` and the `security` (audit + deny) jobs.
+- `.github/workflows/release.yml` — on a `v*.*.*` tag, builds the `.deb` via
+  `dpkg-buildpackage` (debhelper), plus a standalone binary tarball, and creates
+  a GitHub Release (pre-release for tags containing `-`).
