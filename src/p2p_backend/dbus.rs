@@ -179,9 +179,16 @@ impl P2pBackend for DbusBackend {
             .map_err(|e| BackendError::Runtime(format!("P2PDevice.Find failed: {e}")))?;
         log::debug!("P2P find started (advertising WFD IEs)");
 
-        // (d) GroupAdd({persistent: true}) — autonomous GO.
-        let mut add_args: HashMap<&str, Value> = HashMap::new();
-        add_args.insert("persistent", Value::from(true));
+        // (d) GroupAdd — autonomous GO.
+        //
+        // NOTE: the wpa_cli *command* `p2p_group_add persistent` takes a
+        // "persistent" word, but the D-Bus `GroupAdd` method on wpa_supplicant
+        // 2.10 REJECTS a `persistent` key (and a `freq` key) with
+        // `InvalidArgs: Did not receive correct message arguments`. An EMPTY
+        // a{sv} is accepted and creates an autonomous GO — verified live against
+        // wpasupplicant 2.10-21ubuntu0.4 (a new p2p-* interface appears). So
+        // send an empty options dict.
+        let add_args: HashMap<&str, Value> = HashMap::new();
         p2p.call_method("GroupAdd", &(add_args,))
             .map_err(|e| BackendError::Runtime(format!("P2PDevice.GroupAdd failed: {e}")))?;
         log::info!("p2p_group_add issued, waiting for group interface...");
