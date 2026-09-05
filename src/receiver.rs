@@ -137,7 +137,6 @@ impl PipelineBuilder {
         set_if_has(&jitterbuffer, "latency", 80u32); // ms
         set_if_has(&jitterbuffer, "drop-on-latency", true);
         set_if_has(&jitterbuffer, "do-lost", true);
-        set_if_has(&jitterbuffer, "mode", 4i32); // 4 = synced (low-latency)
 
         let rtpdepay = make("rtpmp2tdepay", "rtpdepay")?;
         let tsdemux = make("tsdemux", "demux")?;
@@ -374,10 +373,24 @@ fn make(factory: &str, name: &str) -> Result<gst::Element, String> {
 
 /// Set a property only if the element actually exposes it. GStreamer element
 /// properties vary by version/plugin build, so a hard `set_property` on a
-/// missing property panics — this no-ops instead, keeping tuning best-effort.
+/// missing property — or one whose value type differs (e.g. an enum vs a plain
+/// gint) — panics. This sets ONLY when the property exists AND the value type
+/// matches, otherwise it no-ops (with a debug note), keeping tuning best-effort
+/// and never taking down the pipeline thread over a version-specific property.
 fn set_if_has(el: &gst::Element, name: &str, value: impl Into<gst::glib::Value>) {
-    if el.find_property(name).is_some() {
-        el.set_property(name, value.into());
+    let value = value.into();
+    match el.find_property(name) {
+        Some(pspec) if pspec.value_type() == value.type_() => {
+            el.set_property_from_value(name, &value);
+        }
+        Some(pspec) => {
+            log::debug!(
+                "skip set '{name}': type mismatch (property {}, value {})",
+                pspec.value_type(),
+                value.type_()
+            );
+        }
+        None => {}
     }
 }
 
