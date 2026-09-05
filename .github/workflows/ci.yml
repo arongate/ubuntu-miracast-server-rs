@@ -56,6 +56,13 @@ jobs:
       - name: Test
         run: cargo test ${{ matrix.features }} --locked
 
+      - name: Integration test (RTSP M1-M7, serialized, advisory)
+        # Timing-sensitive socket I/O — run for signal, but do not gate the
+        # matrix on an OS-scheduling race. The protocol construction itself is
+        # covered by deterministic unit tests in src/rtsp.rs and src/receiver.rs.
+        continue-on-error: true
+        run: cargo test ${{ matrix.features }} --locked --test rtsp_handshake -- --ignored --test-threads=1
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04

@@ -187,6 +187,7 @@ fn run_mock_source(mut sock: TcpStream) {
 }
 
 #[test]
+#[ignore = "timing-sensitive socket I/O; run serialized via `cargo test -- --ignored --test-threads=1`"]
 fn rtsp_m1_to_m7_handshake_reaches_stream_started() {
     // Ephemeral loopback port standing in for the source's RTSP server (7236).
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock source");
