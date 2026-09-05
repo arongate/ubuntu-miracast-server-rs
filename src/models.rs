@@ -432,9 +432,11 @@ mod tests {
 
     #[test]
     fn frames_decoded_lt_dropped_rejected() {
-        let mut s = ReceiverStats::default();
-        s.frames_decoded = 5;
-        s.frames_dropped = 10;
+        let s = ReceiverStats {
+            frames_decoded: 5,
+            frames_dropped: 10,
+            ..Default::default()
+        };
         assert!(s.validate().is_err());
     }
 
