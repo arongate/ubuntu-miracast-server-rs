@@ -421,7 +421,7 @@ fn start_dedicated_supplicant(
     p2p_interface: &Option<String>,
     device_name: &str,
 ) -> Option<P2PSupplicantManager> {
-    use crate::utils::list_p2p_interfaces;
+    use crate::utils::list_wifi_interfaces_sysfs;
 
     // Find a suitable adapter: P2P-capable AND not carrying the internet
     // connection. An explicit config/CLI interface wins outright.
@@ -432,19 +432,16 @@ fn start_dedicated_supplicant(
                 .unwrap_or_else(|| p2p.clone()),
         )
     } else {
-        // Auto-select. list_p2p_interfaces()'s D-Bus path reports every iface as
-        // "available" (a real status probe needs sudo), so status alone can't
-        // tell the active Wi-Fi uplink from an idle adapter — and its ordering
-        // is not stable (it flipped wlx→wlo1 between runs). So probe each
-        // candidate for wpa_state=COMPLETED (an active STA connection) and pick
-        // the FIRST idle one, skipping the uplink instead of grabbing it and
-        // failing p2p_group_add. Candidates already "connected" per the list are
-        // skipped cheaply first.
-        let candidates: Vec<String> = list_p2p_interfaces()
-            .into_iter()
-            .filter(|i| i.status != "connected")
-            .map(|i| i.parent)
-            .collect();
+        // Auto-select from SYSFS, not from wpa_supplicant's D-Bus/nmcli lists.
+        // The ideal dedicated adapter is an idle USB dongle that NM is NOT
+        // managing — which is precisely why it is ABSENT from those lists
+        // (unmanaged → not adopted by the system supplicant, shown "unmanaged"
+        // by nmcli). sysfs lists every 802.11 netdev regardless of up/down or
+        // managed state, so we can see it and then bring it up. Among the
+        // candidates, skip whichever is the active Wi-Fi uplink
+        // (wpa_state=COMPLETED) and prefer an idle one.
+        let candidates = list_wifi_interfaces_sysfs();
+        log::debug!("Wi-Fi adapters (sysfs): {}", candidates.join(", "));
         let pick = candidates
             .iter()
             .find(|iface| !adapter_on_wifi(iface))
@@ -453,7 +450,7 @@ fn start_dedicated_supplicant(
             log::info!("Auto-selected {p} for dedicated P2P supplicant");
         } else if !candidates.is_empty() {
             log::info!(
-                "All P2P-capable adapters ({}) are carrying a Wi-Fi connection; \
+                "All Wi-Fi adapters ({}) are carrying a connection; \
                  using system wpa_supplicant",
                 candidates.join(", ")
             );

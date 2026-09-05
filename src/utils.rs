@@ -12,11 +12,13 @@ use std::time::Duration;
 use regex::Regex;
 
 // Allowed characters for wpa_cli parameters:
-// alphanumeric, colons, hyphens, underscores, dots, slashes, spaces.
+// alphanumeric, colons, hyphens, underscores, dots, slashes, spaces, equals.
+// '=' is required by legitimate key=value wpa_cli args (freq=2412,
+// type=progressive) and is not a shell-metacharacter (see WPA_DANGEROUS_CHARS).
 fn wpa_param_re() -> &'static Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9:\-_./ ]+$").unwrap())
+    RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9:\-_./ =]+$").unwrap())
 }
 
 const WPA_PARAM_MAX_LENGTH: usize = 256;
@@ -82,6 +84,37 @@ pub struct InterfaceInfo {
     pub parent: String,
     pub driver: String,
     pub status: String,
+}
+
+/// Enumerate all Wi-Fi-capable network interfaces from sysfs, regardless of
+/// their up/down or NetworkManager-managed state.
+///
+/// This is the authoritative, state-independent source for picking a dedicated
+/// P2P adapter: the ideal adapter is an idle USB dongle that NetworkManager is
+/// NOT managing — which is exactly why it is absent from wpa_supplicant's D-Bus
+/// `Interfaces` list and shows as `unmanaged` in nmcli. sysfs lists every
+/// interface that has a `phy80211` (i.e. is a real 802.11 netdev), including
+/// down/unmanaged ones, so selection can still find and then bring it up.
+/// Excludes `p2p-*` group/child interfaces (they are transient GO netdevs, not
+/// physical adapters).
+pub fn list_wifi_interfaces_sysfs() -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir("/sys/class/net") {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // Physical Wi-Fi netdev = has a phy80211 symlink; skip P2P group ifaces.
+        if name.starts_with("p2p-") {
+            continue;
+        }
+        if entry.path().join("phy80211").exists() {
+            out.push(name);
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Validate and sanitize a wpa_cli parameter.
@@ -534,6 +567,22 @@ mod tests {
         assert!(validate_wpa_param("00:11:22:33:44:55").is_ok());
         assert!(validate_wpa_param("wfd_subelem_set").is_ok());
         assert!(validate_wpa_param("Ubuntu Miracast Server").is_ok());
+        // key=value args used by p2p_group_add / p2p_find (regression: the '='
+        // was missing from the allowlist and rejected freq=2412 in the field).
+        assert!(validate_wpa_param("freq=2412").is_ok());
+        assert!(validate_wpa_param("type=progressive").is_ok());
+    }
+
+    #[test]
+    fn sysfs_wifi_enumeration_excludes_p2p_and_is_graceful() {
+        // Never panics regardless of host; returns physical wifi netdevs only.
+        let ifaces = list_wifi_interfaces_sysfs();
+        assert!(
+            ifaces.iter().all(|i| !i.starts_with("p2p-")),
+            "p2p-* group interfaces must be excluded: {ifaces:?}"
+        );
+        // 'lo' is not a wifi netdev (no phy80211) → must not appear.
+        assert!(!ifaces.iter().any(|i| i == "lo"));
     }
 
     #[test]
