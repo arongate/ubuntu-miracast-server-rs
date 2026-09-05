@@ -1,0 +1,36 @@
+# cargo-deny configuration — supply-chain gates for CI.
+# See https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail on any RUSTSEC advisory (vulnerabilities) or an unmaintained crate.
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Allow the permissive licenses the dependency tree actually uses. GTK/GStreamer
+# bindings are MIT/Apache-2.0; a few crates are Unicode-DFS / MPL.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn on duplicate versions of the same crate (bloat), don't hard-fail.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

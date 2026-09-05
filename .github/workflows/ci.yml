@@ -65,3 +65,23 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+
+  security:
+    name: supply-chain audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # cargo-audit: RUSTSEC vulnerability + yanked-crate scan of Cargo.lock.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # cargo-deny: advisories + license allowlist + source/duplicate policy.
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources bans
+

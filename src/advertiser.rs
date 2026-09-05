@@ -7,6 +7,7 @@
 //! Faithful port of `src/miracast_server/advertiser.py`.
 
 use crate::events::{Event, EventSender};
+use crate::sync_ext::LockExt;
 use crate::utils::{find_p2p_interface, run_wpa_cli, WpaError};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -58,7 +59,7 @@ impl MiracastAdvertiser {
     }
 
     pub fn is_advertising(&self) -> bool {
-        *self.advertising.lock().unwrap()
+        *self.advertising.lock_safe()
     }
 
     pub fn p2p_interface(&self) -> Option<String> {
@@ -70,7 +71,7 @@ impl MiracastAdvertiser {
     }
 
     pub fn group_interface(&self) -> Option<String> {
-        self.group_interface.lock().unwrap().clone()
+        self.group_interface.lock_safe().clone()
     }
 
     /// Allow the app to update the interface at runtime (interface switching).
@@ -100,7 +101,7 @@ impl MiracastAdvertiser {
     /// Start WFD sink advertising by creating an Autonomous P2P Group Owner.
     pub fn start_advertising(&mut self) {
         {
-            let advertising = self.advertising.lock().unwrap();
+            let advertising = self.advertising.lock_safe();
             if *advertising {
                 log::debug!("Already advertising — ignoring");
                 return;
@@ -157,7 +158,7 @@ impl MiracastAdvertiser {
         let group_iface = wait_for_group_interface(Duration::from_secs(10)).ok_or_else(|| {
             WpaError::Runtime("P2P group interface did not appear within 10 seconds".to_string())
         })?;
-        *self.group_interface.lock().unwrap() = Some(group_iface.clone());
+        *self.group_interface.lock_safe() = Some(group_iface.clone());
         log::info!("P2P GO created on interface: {group_iface}");
 
         // Step 5: Set WFD subelements on the group interface too (best-effort).
@@ -171,7 +172,7 @@ impl MiracastAdvertiser {
             log::debug!("Could not set WFD on group iface (may not be needed): {e}");
         }
 
-        *self.advertising.lock().unwrap() = true;
+        *self.advertising.lock_safe() = true;
         let _ = self.events.send(Event::AdvertisingStarted {
             group_interface: group_iface.clone(),
         });
@@ -187,20 +188,20 @@ impl MiracastAdvertiser {
     /// Stop advertising by removing the P2P group.
     pub fn stop_advertising(&mut self) {
         {
-            let mut advertising = self.advertising.lock().unwrap();
+            let mut advertising = self.advertising.lock_safe();
             if !*advertising {
                 return;
             }
             *advertising = false;
         }
 
-        let group = self.group_interface.lock().unwrap().clone();
+        let group = self.group_interface.lock_safe().clone();
         if let Some(group_iface) = group {
             match self.wpa(&["p2p_group_remove", &group_iface], None, false) {
                 Ok(_) => log::info!("Removed P2P group on {group_iface}"),
                 Err(e) => log::warn!("Error removing P2P group: {e}"),
             }
-            *self.group_interface.lock().unwrap() = None;
+            *self.group_interface.lock_safe() = None;
         }
         let _ = self.events.send(Event::AdvertisingStopped);
     }

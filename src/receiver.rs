@@ -18,6 +18,7 @@
 
 use crate::events::{Event, EventSender, StreamStats};
 use crate::models::{IncomingConnection, ReceiverStats, SourceInfo};
+use crate::sync_ext::LockExt;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -419,12 +420,12 @@ impl MiracastReceiver {
     }
 
     pub fn source_info(&self) -> Option<SourceInfo> {
-        self.source_info.lock().unwrap().clone()
+        self.source_info.lock_safe().clone()
     }
 
     /// The pipeline handle (for GUI binding to the paintable sink).
     pub fn pipeline(&self) -> Option<gst::Pipeline> {
-        self.pipeline.lock().unwrap().clone()
+        self.pipeline.lock_safe().clone()
     }
 
     /// Start the RTSP client session with the connected source.
@@ -435,8 +436,8 @@ impl MiracastReceiver {
         }
         self.connection = Some(connection.clone());
         self.state.running.store(true, Ordering::SeqCst);
-        *self.start_time.lock().unwrap() = Some(Local::now());
-        *self.source_info.lock().unwrap() = Some(SourceInfo {
+        *self.start_time.lock_safe() = Some(Local::now());
+        *self.source_info.lock_safe() = Some(SourceInfo {
             name: connection.peer_name.clone(),
             address: connection.peer_address.clone(),
             model: String::new(),
@@ -478,7 +479,7 @@ impl MiracastReceiver {
         self.state.running.store(false, Ordering::SeqCst);
 
         // Stop pipeline.
-        if let Some(p) = self.pipeline.lock().unwrap().take() {
+        if let Some(p) = self.pipeline.lock_safe().take() {
             let _ = p.set_state(gst::State::Null);
         }
 
@@ -514,7 +515,7 @@ fn build_stats(
     video_codec: &Arc<Mutex<String>>,
 ) -> ReceiverStats {
     let end_time = Local::now();
-    let start = *start_time.lock().unwrap();
+    let start = *start_time.lock_safe();
     let duration = start
         .map(|s| (end_time - s).num_seconds().max(0))
         .unwrap_or(0);
@@ -528,8 +529,8 @@ fn build_stats(
         frames_decoded: state.frames_decoded.load(Ordering::SeqCst),
         frames_dropped: state.frames_dropped.load(Ordering::SeqCst),
         errors: state.errors.load(Ordering::SeqCst),
-        resolution: *state.resolution.lock().unwrap(),
-        codec: video_codec.lock().unwrap().clone(),
+        resolution: *state.resolution.lock_safe(),
+        codec: video_codec.lock_safe().clone(),
     }
 }
 
@@ -813,7 +814,7 @@ impl SessionCtx {
                 log::debug!("M4 video formats: {line}");
             } else if line.starts_with("wfd_audio_codecs:") {
                 let codec = if line.contains("LPCM") { "LPCM" } else { "AAC" };
-                *self.audio_codec.lock().unwrap() = codec.to_string();
+                *self.audio_codec.lock_safe() = codec.to_string();
                 log::debug!("M4 audio codec: {codec}");
             } else if line.starts_with("wfd_client_rtp_ports:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -832,9 +833,9 @@ impl SessionCtx {
     /// Build and start the GStreamer pipeline, wiring bus + probe + stats.
     fn start_pipeline(&self) {
         let builder = PipelineBuilder::new(self.headless);
-        let video_codec = self.video_codec.lock().unwrap().clone();
+        let video_codec = self.video_codec.lock_safe().clone();
         let audio_codec = if self.audio_enabled {
-            self.audio_codec.lock().unwrap().clone()
+            self.audio_codec.lock_safe().clone()
         } else {
             "AAC".to_string()
         };
@@ -879,7 +880,7 @@ impl SessionCtx {
                             state.use_hw_decode.store(false, Ordering::SeqCst);
                             // Rebuild handled by stop+restart on next start_pipeline;
                             // here we tear down so the SW path is rebuilt.
-                            if let Some(p) = pipeline_arc.lock().unwrap().take() {
+                            if let Some(p) = pipeline_arc.lock_safe().take() {
                                 let _ = p.set_state(gst::State::Null);
                             }
                             let _ = epoch; // reserved for future timing use
@@ -889,7 +890,7 @@ impl SessionCtx {
                     }
                     MessageView::Eos(_) => {
                         log::info!("Pipeline received EOS");
-                        if let Some(p) = pipeline_arc.lock().unwrap().take() {
+                        if let Some(p) = pipeline_arc.lock_safe().take() {
                             let _ = p.set_state(gst::State::Null);
                         }
                         let _ = events.send(Event::StreamStopped(ReceiverStats::default()));
@@ -934,7 +935,7 @@ impl SessionCtx {
             }
         }
 
-        *self.pipeline.lock().unwrap() = Some(pipeline);
+        *self.pipeline.lock_safe() = Some(pipeline);
 
         // Stats monitor thread.
         let stats_ctx = StatsCtx {
@@ -951,7 +952,7 @@ impl SessionCtx {
     }
 
     fn stop_pipeline_and_emit(&self) {
-        if let Some(p) = self.pipeline.lock().unwrap().take() {
+        if let Some(p) = self.pipeline.lock_safe().take() {
             let _ = p.set_state(gst::State::Null);
         }
         let stats = build_stats(&self.state, &self.start_time, &self.video_codec);
@@ -974,10 +975,9 @@ impl StatsCtx {
         let mut last_bytes: u64 = 0;
         let mut frame_history: Vec<(Instant, i64, i64)> = Vec::new();
 
-        while self.state.running.load(Ordering::SeqCst) && self.pipeline.lock().unwrap().is_some() {
+        while self.state.running.load(Ordering::SeqCst) && self.pipeline.lock_safe().is_some() {
             std::thread::sleep(STATS_INTERVAL);
-            if !self.state.running.load(Ordering::SeqCst) || self.pipeline.lock().unwrap().is_none()
-            {
+            if !self.state.running.load(Ordering::SeqCst) || self.pipeline.lock_safe().is_none() {
                 break;
             }
 
@@ -1026,7 +1026,7 @@ impl StatsCtx {
                 if silence >= RTP_TIMEOUT {
                     let msg = format!("Stream lost: no RTP data for {:.1}s", silence.as_secs_f64());
                     log::error!("{msg}");
-                    if let Some(p) = self.pipeline.lock().unwrap().take() {
+                    if let Some(p) = self.pipeline.lock_safe().take() {
                         let _ = p.set_state(gst::State::Null);
                     }
                     let _ = self.events.send(Event::StreamError(msg));
@@ -1036,8 +1036,7 @@ impl StatsCtx {
 
             let duration = self
                 .start_time
-                .lock()
-                .unwrap()
+                .lock_safe()
                 .map(|s| (Local::now() - s).num_seconds().max(0))
                 .unwrap_or(0);
             let _ = self.events.send(Event::StatsUpdated(StreamStats {
@@ -1045,7 +1044,7 @@ impl StatsCtx {
                 peak_bitrate: self.state.peak_bitrate_milli.load(Ordering::SeqCst) as f64 / 1000.0,
                 frames_decoded: decoded,
                 frames_dropped: dropped,
-                resolution: *self.state.resolution.lock().unwrap(),
+                resolution: *self.state.resolution.lock_safe(),
                 data_received: current_bytes as i64,
                 duration,
             }));

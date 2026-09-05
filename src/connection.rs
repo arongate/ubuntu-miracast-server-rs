@@ -14,6 +14,7 @@
 
 use crate::events::{Event, EventSender};
 use crate::models::IncomingConnection;
+use crate::sync_ext::LockExt;
 use crate::utils::run_wpa_cli;
 use chrono::Local;
 use rand::Rng;
@@ -103,11 +104,11 @@ impl ConnectionHandler {
     }
 
     pub fn active_connection(&self) -> Option<IncomingConnection> {
-        self.shared.active_connection.lock().unwrap().clone()
+        self.shared.active_connection.lock_safe().clone()
     }
 
     pub fn set_ctrl_path(&self, ctrl_path: Option<String>) {
-        *self.shared.ctrl_path.lock().unwrap() = ctrl_path;
+        *self.shared.ctrl_path.lock_safe() = ctrl_path;
     }
 
     pub fn set_p2p_interface(&mut self, iface: impl Into<String>) {
@@ -122,7 +123,7 @@ impl ConnectionHandler {
             return;
         }
         let group_interface = group_interface.into();
-        *self.shared.group_interface.lock().unwrap() = Some(group_interface.clone());
+        *self.shared.group_interface.lock_safe() = Some(group_interface.clone());
         self.shared.running.store(true, Ordering::SeqCst);
 
         // NOTE: DHCP setup and the initial WPS-PIN arm each block for seconds
@@ -138,11 +139,11 @@ impl ConnectionHandler {
                 .spawn(move || {
                     // Set up IP + DHCP FIRST (before any client tries to connect).
                     let our_ip = setup_dhcp(&group);
-                    *shared.our_ip.lock().unwrap() = our_ip;
+                    *shared.our_ip.lock_safe() = our_ip;
 
                     // Generate + arm the initial WPS PIN.
                     let pin = generate_pin();
-                    *shared.current_pin.lock().unwrap() = Some(pin.clone());
+                    *shared.current_pin.lock_safe() = Some(pin.clone());
                     let _ = shared.events.send(Event::PinDisplay {
                         pin: pin.clone(),
                         peer_info: "Waiting for source...".to_string(),
@@ -175,7 +176,7 @@ impl ConnectionHandler {
     }
 
     pub fn disconnect_peer(&self) {
-        *self.shared.active_connection.lock().unwrap() = None;
+        *self.shared.active_connection.lock_safe() = None;
     }
 
     /// Generate a new PIN and re-arm WPS for the next connection.
@@ -184,7 +185,7 @@ impl ConnectionHandler {
     /// thread rather than blocking the main loop.
     pub fn rearm_wps_pin(&self) {
         let pin = generate_pin();
-        *self.shared.current_pin.lock().unwrap() = Some(pin.clone());
+        *self.shared.current_pin.lock_safe() = Some(pin.clone());
         let _ = self.shared.events.send(Event::PinDisplay {
             pin: pin.clone(),
             peer_info: "Waiting for source...".to_string(),
@@ -208,9 +209,9 @@ impl Drop for ConnectionHandler {
 /// Arm the WPS registrar on the group interface with the current PIN.
 /// Retries up to 10 times with 1s delays (control socket may not be ready).
 fn arm_wps_pin(shared: &Arc<Shared>) {
-    let group = shared.group_interface.lock().unwrap().clone();
-    let pin = shared.current_pin.lock().unwrap().clone();
-    let ctrl = shared.ctrl_path.lock().unwrap().clone();
+    let group = shared.group_interface.lock_safe().clone();
+    let pin = shared.current_pin.lock_safe().clone();
+    let ctrl = shared.ctrl_path.lock_safe().clone();
     let (group, pin) = match (group, pin) {
         (Some(g), Some(p)) => (g, p),
         _ => return,
@@ -237,11 +238,10 @@ fn arm_wps_pin(shared: &Arc<Shared>) {
 fn event_monitor_loop(shared: Arc<Shared>) {
     let group = shared
         .group_interface
-        .lock()
-        .unwrap()
+        .lock_safe()
         .clone()
         .unwrap_or_default();
-    let ctrl = shared.ctrl_path.lock().unwrap().clone();
+    let ctrl = shared.ctrl_path.lock_safe().clone();
     log::info!("Event monitor starting on group interface {group}");
 
     let mut cmd = Command::new("sudo");
@@ -353,12 +353,7 @@ fn event_monitor_loop(shared: Arc<Shared>) {
             continue;
         }
         if line.contains("WPS-PIN-NEEDED") {
-            let pin = shared
-                .current_pin
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_default();
+            let pin = shared.current_pin.lock_safe().clone().unwrap_or_default();
             log::warn!("WPS-PIN-NEEDED: re-arming PIN {pin}");
             arm_wps_pin(&shared);
             continue;
@@ -385,7 +380,7 @@ fn event_monitor_loop(shared: Arc<Shared>) {
 
 fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
     log::info!("Source connected: {peer_mac}");
-    let our_ip = shared.our_ip.lock().unwrap().clone();
+    let our_ip = shared.our_ip.lock_safe().clone();
 
     // Wait for DHCP lease (up to 15s), else fall back to the first range IP.
     let peer_ip = wait_for_dhcp_lease(shared, peer_mac, group, Duration::from_secs(15))
@@ -405,7 +400,7 @@ fn handle_sta_connected(shared: &Arc<Shared>, peer_mac: &str, group: &str) {
         true,
     ) {
         Ok(conn) => {
-            *shared.active_connection.lock().unwrap() = Some(conn.clone());
+            *shared.active_connection.lock_safe() = Some(conn.clone());
             let _ = shared.events.send(Event::ConnectionReceived(conn));
         }
         Err(e) => {
@@ -455,7 +450,7 @@ fn wait_for_dhcp_lease(
 
 fn handle_sta_disconnected(shared: &Arc<Shared>) {
     let was_connected = {
-        let mut guard = shared.active_connection.lock().unwrap();
+        let mut guard = shared.active_connection.lock_safe();
         let was = guard.is_some();
         *guard = None;
         was
@@ -465,7 +460,7 @@ fn handle_sta_disconnected(shared: &Arc<Shared>) {
         let _ = shared.events.send(Event::ConnectionLost);
         // Re-arm WPS for the next connection.
         let pin = generate_pin();
-        *shared.current_pin.lock().unwrap() = Some(pin.clone());
+        *shared.current_pin.lock_safe() = Some(pin.clone());
         arm_wps_pin(shared);
         let _ = shared.events.send(Event::PinDisplay {
             pin: pin.clone(),

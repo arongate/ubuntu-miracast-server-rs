@@ -9,6 +9,7 @@ pub mod events;
 pub mod history;
 pub mod models;
 pub mod rtsp;
+pub mod sync_ext;
 pub mod utils;
 
 pub mod advertiser;
