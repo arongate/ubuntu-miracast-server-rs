@@ -156,30 +156,27 @@ impl P2pBackend for DbusBackend {
         let (iface, dev_obj) = self.ensure_device_obj()?;
         log::info!("Setting up P2P GO on {iface}");
 
-        // (a0) Enable global WFD advertisement. This is the ONE thing the D-Bus
-        //      interface cannot do on wpa_supplicant 2.10: `WFDIEs` is writable
-        //      but INERT unless the global `wifi_display` flag is set, and there
-        //      is no D-Bus property/method for it (verified live — the root
-        //      object exposes only WFDIEs). So issue the single `wpa_cli set
-        //      wifi_display 1` here; everything else stays on D-Bus. Without
-        //      this the WFD IEs never reach the beacon and no phone discovers
-        //      the sink. (netdev-group control socket → no sudo where the socket
-        //      is group-accessible; otherwise this one call needs privilege.)
-        if let Err(e) =
-            crate::utils::run_wpa_cli(&iface, &["set", "wifi_display", "1"], false, None)
-        {
-            log::warn!(
-                "Could not enable wifi_display via wpa_cli ({e}); WFD IEs may not advertise"
-            );
+        // (a) WFD advertisement. On wpa_supplicant 2.10 the D-Bus surface CANNOT
+        //     do this: `set wifi_display 1` has no D-Bus setter, and — verified
+        //     live — the D-Bus `WFDIEs` property is INERT (a write reads back
+        //     `ay 0` even with wifi_display=1). The `wfd_subelem_set` control
+        //     command DOES populate the IEs (after it, WFDIEs reads non-empty).
+        //     So drive WFD via wpa_cli (netdev-group control socket → no sudo
+        //     where the socket is group-accessible), byte-identical to the CLI
+        //     backend's subelements 0/1/6. Everything else stays on D-Bus.
+        let dev_info = cli::encode_wfd_device_info(rtsp_port);
+        let wfd_steps: [&[&str]; 4] = [
+            &["set", "wifi_display", "1"],
+            &["wfd_subelem_set", "0", &dev_info],
+            &["wfd_subelem_set", "1", WFD_ASSOCIATED_BSSID_SUBELEMENT_HEX],
+            &["wfd_subelem_set", "6", WFD_COUPLED_SINK_SUBELEMENT_HEX],
+        ];
+        for step in wfd_steps {
+            if let Err(e) = crate::utils::run_wpa_cli(&iface, step, false, None) {
+                log::warn!("WFD setup step {step:?} failed ({e}); sink may not advertise");
+            }
         }
-
-        // (a) WFDIEs on the ROOT object — hex-decode of the exact CLI payload:
-        //     0006 0011 <rtsp_port BE> 012C  ++ associated-BSSID ++ coupled-sink.
-        let wfd_ies = build_wfd_ies(rtsp_port)?;
-        let root = self.proxy(WPA_ROOT_PATH, IFACE_ROOT)?;
-        root.set_property::<Vec<u8>>("WFDIEs", wfd_ies)
-            .map_err(|e| BackendError::Runtime(format!("set WFDIEs failed: {e}")))?;
-        log::debug!("WFD subelements configured");
+        log::debug!("WFD subelements configured via wpa_cli");
 
         // (b) P2PDeviceConfig (a{sv}) on the P2PDevice interface of our device.
         let p2p = self.proxy_at(&dev_obj, IFACE_P2PDEVICE)?;
@@ -538,41 +535,6 @@ fn remove_stale_p2p_groups(parent_iface: &str) {
     }
 }
 
-/// Decode an even-length hex string to bytes. Returns `Value`/Runtime error on
-/// malformed input (should never happen for compile-time constants).
-fn hex_decode(s: &str) -> BackendResult<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return Err(BackendError::Value(format!("odd-length hex: {s}")));
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for i in (0..bytes.len()).step_by(2) {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> BackendResult<u8> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(BackendError::Value(format!("bad hex byte: {}", b as char))),
-    }
-}
-
-/// Assemble the raw `WFDIEs` byte array: hex-decode of
-/// `cli::encode_wfd_device_info(port)` (device-info subelement) followed by the
-/// associated-BSSID and coupled-sink subelements — byte-for-byte the CLI set.
-fn build_wfd_ies(rtsp_port: u16) -> BackendResult<Vec<u8>> {
-    let mut ies = hex_decode(&cli::encode_wfd_device_info(rtsp_port))?;
-    ies.extend_from_slice(&hex_decode(WFD_ASSOCIATED_BSSID_SUBELEMENT_HEX)?);
-    ies.extend_from_slice(&hex_decode(WFD_COUPLED_SINK_SUBELEMENT_HEX)?);
-    Ok(ies)
-}
-
 /// Format 6 MAC bytes as lowercase `xx:xx:xx:xx:xx:xx`.
 fn format_mac(addr: &[u8]) -> String {
     addr.iter()
@@ -586,41 +548,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wfd_ies_device_info_prefix_for_7236() {
-        // cli::encode_wfd_device_info(7236) == "000600111C44012C"
-        // -> bytes: 00 06 00 11 1C 44 01 2C
-        let ies = build_wfd_ies(7236).expect("build");
-        assert_eq!(
-            &ies[0..8],
-            &[0x00, 0x06, 0x00, 0x11, 0x1C, 0x44, 0x01, 0x2C]
-        );
-    }
-
-    #[test]
-    fn wfd_ies_full_assembly_matches_cli_subelements() {
-        let ies = build_wfd_ies(7236).expect("build");
-        // device-info (8) + associated-bssid (8) + coupled-sink (9) = 25 bytes.
-        assert_eq!(ies.len(), 8 + 8 + 9);
-        // associated-BSSID subelement: 00 06 00 00 00 00 00 00
-        assert_eq!(
-            &ies[8..16],
-            &[0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        );
-        // coupled-sink subelement: 00 07 00 00 00 00 00 00 00
-        assert_eq!(
-            &ies[16..25],
-            &[0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-        );
-    }
-
-    #[test]
-    fn hex_decode_roundtrip() {
-        assert_eq!(
-            hex_decode("000600111C44012C").unwrap(),
-            vec![0x00, 0x06, 0x00, 0x11, 0x1C, 0x44, 0x01, 0x2C]
-        );
-        assert!(hex_decode("ABC").is_err()); // odd length
-        assert!(hex_decode("ZZ").is_err()); // bad nibble
+    fn wfd_subelem_hex_matches_cli_encoding() {
+        // The D-Bus backend passes these hex strings straight to
+        // `wfd_subelem_set` (verified live to populate WFDIEs). They must match
+        // the CLI backend's device-info encoding + subelement constants.
+        assert_eq!(cli::encode_wfd_device_info(7236), "000600111C44012C");
+        assert_eq!(WFD_ASSOCIATED_BSSID_SUBELEMENT_HEX, "0006000000000000");
+        assert_eq!(WFD_COUPLED_SINK_SUBELEMENT_HEX, "000700000000000000");
     }
 
     #[test]
