@@ -842,74 +842,109 @@ impl SessionCtx {
         let use_hw = self.state.use_hw_decode.load(Ordering::SeqCst);
         let rtp_port = self.rtp_port.load(Ordering::SeqCst);
 
-        let pipeline = match builder.build_pipeline(
-            rtp_port,
-            &video_codec,
-            &audio_codec,
-            self.audio_enabled,
-            use_hw,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                let msg = format!("Failed to start pipeline: {e}");
+        // Build → wire bus → PLAYING, retrying once in SOFTWARE if a HW decoder
+        // (vaapidecodebin/nvh264dec) fails to reach PLAYING. A failed PLAYING
+        // transition is a SYNCHRONOUS StateChangeError, not a bus Error message,
+        // so the bus-watch fallback never sees it — we must retry inline here.
+        // `attempts` is [true, false] when HW was requested, else just [false].
+        let attempts: &[bool] = if use_hw { &[true, false] } else { &[false] };
+        let mut pipeline: Option<gst::Pipeline> = None;
+        for (i, &hw) in attempts.iter().enumerate() {
+            let built = match builder.build_pipeline(
+                rtp_port,
+                &video_codec,
+                &audio_codec,
+                self.audio_enabled,
+                hw,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let msg = format!("Failed to start pipeline: {e}");
+                    log::error!("{msg}");
+                    self.state.errors.fetch_add(1, Ordering::SeqCst);
+                    let _ = self.events.send(Event::StreamError(msg));
+                    return;
+                }
+            };
+
+            // Wire the bus watch (HW→SW fallback for async decode ERRORS, EOS,
+            // state) before going to PLAYING.
+            let bus = built.bus().expect("pipeline has a bus");
+            {
+                let state = Arc::clone(&self.state);
+                let events = self.events.clone();
+                let pipeline_arc = Arc::clone(&self.pipeline);
+                let epoch = self.epoch;
+                let _ = bus.add_watch(move |_bus, msg| {
+                    use gst::MessageView;
+                    match msg.view() {
+                        MessageView::Error(err) => {
+                            let emsg = format!("Pipeline error: {}", err.error());
+                            log::error!("{emsg} (debug: {:?})", err.debug());
+                            state.errors.fetch_add(1, Ordering::SeqCst);
+                            if state.use_hw_decode.load(Ordering::SeqCst)
+                                && err.error().to_string().to_lowercase().contains("decode")
+                            {
+                                log::warn!("Attempting software decode fallback");
+                                state.use_hw_decode.store(false, Ordering::SeqCst);
+                                if let Some(p) = pipeline_arc.lock_safe().take() {
+                                    let _ = p.set_state(gst::State::Null);
+                                }
+                                let _ = epoch;
+                            } else {
+                                let _ = events.send(Event::StreamError(emsg));
+                            }
+                        }
+                        MessageView::Eos(_) => {
+                            log::info!("Pipeline received EOS");
+                            if let Some(p) = pipeline_arc.lock_safe().take() {
+                                let _ = p.set_state(gst::State::Null);
+                            }
+                            let _ = events.send(Event::StreamStopped(ReceiverStats::default()));
+                            state.running.store(false, Ordering::SeqCst);
+                        }
+                        MessageView::StateChanged(_) => {}
+                        _ => {}
+                    }
+                    gst::glib::ControlFlow::Continue
+                });
+            }
+
+            if built.set_state(gst::State::Playing) != Err(gst::StateChangeError) {
+                if hw {
+                    log::info!("Pipeline reached PLAYING (hardware decode)");
+                } else if i > 0 {
+                    log::info!("Pipeline reached PLAYING (software-decode fallback)");
+                } else {
+                    log::info!("Pipeline reached PLAYING (software decode)");
+                }
+                pipeline = Some(built);
+                break;
+            }
+
+            // PLAYING failed. Tear this pipeline down. If it was the HW attempt
+            // and a SW attempt remains, fall through to rebuild in software.
+            let _ = built.set_state(gst::State::Null);
+            if hw && i + 1 < attempts.len() {
+                log::warn!(
+                    "Hardware decoder failed to reach PLAYING — retrying with software decode"
+                );
+                self.state.use_hw_decode.store(false, Ordering::SeqCst);
+            }
+        }
+
+        let pipeline = match pipeline {
+            Some(p) => p,
+            None => {
+                let msg = "Pipeline failed to transition to PLAYING (hardware and software \
+                           decode both failed)"
+                    .to_string();
                 log::error!("{msg}");
                 self.state.errors.fetch_add(1, Ordering::SeqCst);
                 let _ = self.events.send(Event::StreamError(msg));
                 return;
             }
         };
-
-        // Bus watch (HW→SW fallback, EOS, state).
-        let bus = pipeline.bus().expect("pipeline has a bus");
-        {
-            let state = Arc::clone(&self.state);
-            let events = self.events.clone();
-            let pipeline_arc = Arc::clone(&self.pipeline);
-            let epoch = self.epoch;
-            let _ = bus.add_watch(move |_bus, msg| {
-                use gst::MessageView;
-                match msg.view() {
-                    MessageView::Error(err) => {
-                        let emsg = format!("Pipeline error: {}", err.error());
-                        log::error!("{emsg} (debug: {:?})", err.debug());
-                        state.errors.fetch_add(1, Ordering::SeqCst);
-                        if state.use_hw_decode.load(Ordering::SeqCst)
-                            && err.error().to_string().to_lowercase().contains("decode")
-                        {
-                            log::warn!("Attempting software decode fallback");
-                            state.use_hw_decode.store(false, Ordering::SeqCst);
-                            // Rebuild handled by stop+restart on next start_pipeline;
-                            // here we tear down so the SW path is rebuilt.
-                            if let Some(p) = pipeline_arc.lock_safe().take() {
-                                let _ = p.set_state(gst::State::Null);
-                            }
-                            let _ = epoch; // reserved for future timing use
-                        } else {
-                            let _ = events.send(Event::StreamError(emsg));
-                        }
-                    }
-                    MessageView::Eos(_) => {
-                        log::info!("Pipeline received EOS");
-                        if let Some(p) = pipeline_arc.lock_safe().take() {
-                            let _ = p.set_state(gst::State::Null);
-                        }
-                        let _ = events.send(Event::StreamStopped(ReceiverStats::default()));
-                        state.running.store(false, Ordering::SeqCst);
-                    }
-                    MessageView::StateChanged(_) => {}
-                    _ => {}
-                }
-                gst::glib::ControlFlow::Continue
-            });
-        }
-
-        if pipeline.set_state(gst::State::Playing) == Err(gst::StateChangeError) {
-            let msg = "Pipeline failed to transition to PLAYING".to_string();
-            log::error!("{msg}");
-            self.state.errors.fetch_add(1, Ordering::SeqCst);
-            let _ = self.events.send(Event::StreamError(msg));
-            return;
-        }
 
         self.state
             .last_rtp_ns
