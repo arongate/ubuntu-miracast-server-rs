@@ -161,6 +161,27 @@ impl P2pBackend for WpaCliBackend {
             })?;
         log::info!("P2P GO created on interface: {group_iface}");
 
+        // Report the GO's operating frequency so discovery health is visible at
+        // a glance: a phone finds the sink via P2P discovery on the 2.4GHz
+        // social channels, so the GO should be ~2412MHz. (wpa_cli status on the
+        // group iface reports freq=; iw dev <go> info does NOT.)
+        if let Ok(status) = self.wpa(&["status"], Some(&group_iface), true) {
+            if let Some(freq) = status
+                .lines()
+                .find_map(|l| l.strip_prefix("freq="))
+                .map(str::trim)
+            {
+                let band = if freq.starts_with("24") {
+                    "2.4GHz — good for P2P discovery"
+                } else if freq.starts_with('5') {
+                    "5GHz — phones may NOT discover the sink here"
+                } else {
+                    "unknown band"
+                };
+                log::info!("P2P GO operating frequency: {freq} MHz ({band})");
+            }
+        }
+
         // Best-effort: set WFD subelements on the group interface too.
         if let Err(e) = self.wpa(&["set", "wifi_display", "1"], Some(&group_iface), false) {
             log::debug!("Could not set WFD on group iface (may not be needed): {e}");

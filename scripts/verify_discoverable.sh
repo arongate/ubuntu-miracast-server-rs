@@ -87,10 +87,13 @@ ok "sink GO is up (group iface: ${GROUP_IFACE:-unknown})"
 # the frequency from the phy's in-use survey instead.
 if [ -n "${GROUP_IFACE:-}" ]; then
   GO_WIPHY="$(iw dev "$GROUP_IFACE" info 2>/dev/null | awk '/wiphy/{print $2}')"
-  FREQ="$(iw dev "$GROUP_IFACE" survey dump 2>/dev/null \
+  # Primary: the sink logs its GO operating frequency.
+  FREQ="$(grep -oE 'P2P GO operating frequency: [0-9]+' "$LOG" | tail -1 | grep -oE '[0-9]+')"
+  # Fallback 1: the phy's in-use survey.
+  [ -z "$FREQ" ] && FREQ="$(iw dev "$GROUP_IFACE" survey dump 2>/dev/null \
            | awk '/\[in use\]/{print $2}' | head -1)"
   if [ -z "$FREQ" ]; then
-    # Fallback: scan the phy for our own BSS by the GO's MAC.
+    # Fallback 2: scan the phy for our own BSS by the GO's MAC.
     GO_MAC="$(iw dev "$GROUP_IFACE" info 2>/dev/null | awk '/addr/{print $2}')"
     FREQ="$(iw dev "$GROUP_IFACE" scan dump 2>/dev/null | awk -v m="$GO_MAC" '
             /^BSS/{bss=$2} /freq:/{f=$2} bss ~ m {print f; exit}')"
