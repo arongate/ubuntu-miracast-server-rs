@@ -830,6 +830,33 @@ impl SessionCtx {
         }
     }
 
+    /// Fast, up-front probe: can ANY audio sink actually open on this host/run
+    /// context? pulsesink connects to PulseAudio at the READY transition, which
+    /// fails ("Connection refused") when there is no user PA session (e.g. under
+    /// sudo). We test that cheaply — set a standalone sink to READY with a short
+    /// wait — so the real pipeline is built audio-on ONLY when audio can work,
+    /// avoiding a failed PLAYING attempt that would delay the RTSP M7 response.
+    fn audio_sink_available() -> bool {
+        for factory in ["pulsesink", "autoaudiosink"] {
+            let Ok(sink) = gst::ElementFactory::make(factory).build() else {
+                continue;
+            };
+            // READY is where pulsesink opens the device/connects to PA.
+            if sink.set_state(gst::State::Ready).is_ok() {
+                // Confirm it actually settled into READY (async sinks).
+                let settled = sink.state(gst::ClockTime::from_seconds(2)).0.is_ok();
+                let _ = sink.set_state(gst::State::Null);
+                if settled {
+                    log::debug!("Audio sink available: {factory}");
+                    return true;
+                }
+            } else {
+                let _ = sink.set_state(gst::State::Null);
+            }
+        }
+        false
+    }
+
     /// Build and start the GStreamer pipeline, wiring bus + probe + stats.
     fn start_pipeline(&self) {
         let builder = PipelineBuilder::new(self.headless);
@@ -842,27 +869,26 @@ impl SessionCtx {
         let use_hw = self.state.use_hw_decode.load(Ordering::SeqCst);
         let rtp_port = self.rtp_port.load(Ordering::SeqCst);
 
-        // Build → wire bus → PLAYING, with two independent fallbacks, because a
-        // failed PLAYING transition is a SYNCHRONOUS StateChangeError the
-        // bus-watch never sees — we must retry inline:
-        //   • decode: HW (vaapi/nvh264) → SW (avdec_h264)
-        //   • audio:  with the audio branch → WITHOUT it (video-only)
-        // The audio sink (pulsesink) fails PLAYING with "Connection refused"
-        // when there is no PulseAudio session (e.g. running under sudo), and
-        // that failure takes the WHOLE pipeline — including video — down. So on
-        // an audio-sink error we rebuild audio-off and keep the picture.
-        // `attempts` = (use_hw, audio_enabled), most-capable first.
-        let want_audio = self.audio_enabled;
+        // Build → wire bus → PLAYING, with a decode fallback (HW→SW). Audio is
+        // decided UP FRONT by a fast probe rather than by failing PLAYING: a
+        // failed audio attempt costs a full state() wait, which previously
+        // pushed the M7/PLAY response past the source's RTSP timeout ("No M7
+        // response"). So probe once here — if no audio sink can open (e.g. no
+        // PulseAudio session under sudo), build video-only on the first try.
+        let want_audio = self.audio_enabled && Self::audio_sink_available();
+        if self.audio_enabled && !want_audio {
+            log::warn!(
+                "Audio disabled: no audio sink could open (no PulseAudio session? — running \
+                 under sudo drops the user audio session). Streaming video-only."
+            );
+        }
         let mut attempts: Vec<(bool, bool)> = Vec::new();
         for &hw in if use_hw {
             &[true, false][..]
         } else {
             &[false][..]
         } {
-            if want_audio {
-                attempts.push((hw, true));
-            }
-            attempts.push((hw, false));
+            attempts.push((hw, want_audio));
         }
         let mut pipeline: Option<gst::Pipeline> = None;
         let n_attempts = attempts.len();
@@ -925,11 +951,14 @@ impl SessionCtx {
             // StateChangeSuccess::Async immediately — the transition only
             // settles once data flows and the demuxer's pads are added/linked.
             // Do NOT treat the immediate return as final: set PLAYING, then wait
-            // on state() for the real outcome.
+            // briefly on state() for the real outcome. Keep the wait SHORT (3s):
+            // a live source returns NoPreroll almost immediately, and the RTSP
+            // M7/PLAY response that follows must not be delayed past the
+            // source's timeout.
             let start = built.set_state(gst::State::Playing);
             let reached = match start {
                 Err(gst::StateChangeError) => false,
-                Ok(_) => built.state(gst::ClockTime::from_seconds(8)).0.is_ok(),
+                Ok(_) => built.state(gst::ClockTime::from_seconds(3)).0.is_ok(),
             };
             if reached {
                 log::info!(
